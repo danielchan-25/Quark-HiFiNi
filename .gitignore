@@ -1,0 +1,18 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime state: this project persists only SQLite state and JSONL logs.
+data/
+logs/
+
+# Python and editor-local files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
