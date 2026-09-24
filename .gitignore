@@ -3,9 +3,10 @@
 .env.*
 !.env.example
 
-# Runtime state: this project persists only SQLite state and JSONL logs.
+# Runtime databases, migration backups, lock file and legacy logs.
 data/
 logs/
+upload-files/
 
 # Python and editor-local files
 __pycache__/
