@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Quark-HiFiNi every day at 06:00 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=quark-hifini-daily.service
+
+[Install]
+WantedBy=timers.target
