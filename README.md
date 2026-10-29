@@ -1,6 +1,6 @@
-# Quark-HiFiNi-Linux
+# Quark-HiFiNi
 
-面向 Ubuntu 桌面的 Quark → HiFiNi 自动上传、发布与每日总结模板，基于 [Quark-HiFiNi](https://github.com/danielchan-25/Quark-HiFiNi) 的 Python 工作流。
+面向 Ubuntu 桌面的 Quark → HiFiNi 自动上传、发布与每日总结工具，使用 Python 工作流完成任务。
 
 这是可配置的独立项目，不携带原设备的数据库、网盘授权、浏览器登录、密钥或定时任务。正式使用前必须完成本机授权和一次预览验收。
 
@@ -19,8 +19,8 @@
 基线为 Ubuntu 24.04 LTS、Python 3.12。还需要 Bash、curl、FFmpeg/ffprobe、符合夸克官方 Skill 要求的 Node.js，以及 Google Chrome 或可用的 Chromium 浏览器。
 
 ```bash
-git clone https://github.com/danielchan-25/Quark-HiFiNi-Linux.git
-cd Quark-HiFiNi-Linux
+git clone https://github.com/danielchan-25/Quark-HiFiNi.git
+cd Quark-HiFiNi
 bash scripts/setup-ubuntu.sh --install-system-packages
 cp .env.example .env
 ```
