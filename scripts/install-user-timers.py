@@ -22,7 +22,8 @@ def render_service(text: str, root: Path) -> str:
     lines = []
     for line in text.splitlines():
         if line.startswith('WorkingDirectory='):
-            line = 'WorkingDirectory=' + quote_systemd_path(str(root))
+            # systemd directory directives accept spaces but not shell quotes.
+            line = 'WorkingDirectory=' + str(root).replace('\\', '\\\\').replace('%', '%%')
         elif line.startswith('ExecStart='):
             suffix = line.split('@PROJECT_ROOT@/', 1)[1]
             script, _, arguments = suffix.partition(' ')
@@ -42,7 +43,7 @@ def main() -> int:
         parser.error('Run as your Ubuntu desktop user, not root')
     destination = args.unit_dir or Path(os.getenv('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'systemd' / 'user'
     files = {}
-    for name in ('quark-hifini-daily', 'quark-hifini-summary'):
+    for name in ('quark-hifini-daily', 'quark-hifini-summary', 'quark-hifini-monitor'):
         files[name + '.service'] = render_service((ROOT / 'systemd' / (name + '.service.in')).read_text(encoding='utf-8'), ROOT)
         files[name + '.timer'] = (ROOT / 'systemd' / (name + '.timer')).read_text(encoding='utf-8')
     if not args.overwrite and any((destination / name).exists() for name in files):
@@ -52,7 +53,8 @@ def main() -> int:
         (destination / name).write_text(text, encoding='utf-8')
     print(f'Generated disabled user units in {destination}.')
     print('After validation: systemctl --user daemon-reload')
-    print('Then explicitly enable: systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer')
+    print('Initialize monitoring: bash scripts/monitor.sh init')
+    print('Then explicitly enable: systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer')
     print('Keep the desktop session active and the computer awake. Persistent=false does not backfill missed slots.')
     return 0
 

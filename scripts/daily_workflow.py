@@ -21,6 +21,17 @@ def invoke(arguments: list[str]) -> int:
         return 1
 
 
+def stage(name: str, arguments: list[str]) -> int:
+    started = time.monotonic()
+    print(json.dumps({'time': datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                      'event': 'workflow_stage_started', 'stage': name}), flush=True)
+    code = invoke(arguments)
+    print(json.dumps({'time': datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                      'event': 'workflow_stage_finished', 'stage': name, 'exit_code': code,
+                      'duration_seconds': round(time.monotonic() - started, 3)}), flush=True)
+    return code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
@@ -47,17 +58,17 @@ def main() -> int:
         session_id = f'{int(time.time())}-{secrets.token_hex(3)}'
         run = ['bash', str(ROOT / 'scripts' / 'run.sh')]
         tracking = ['--session-input', session_input, '--session-id', session_id]
-        result = {'date': day, 'upload_exit': invoke(run + ['upload', '--apply', '--slot-date', day] + tracking)}
-        result['check_exit'] = invoke(run + ['check'])
+        result = {'date': day, 'upload_exit': stage('upload', run + ['upload', '--apply', '--slot-date', day] + tracking)}
+        result['check_exit'] = stage('preflight', run + ['check'])
         if result['check_exit']:
             result['publication'] = 'blocked_by_preflight'
         else:
-            browser_exit = invoke(['bash', str(ROOT / 'scripts' / 'start-browser.sh')])
+            browser_exit = stage('browser', ['bash', str(ROOT / 'scripts' / 'start-browser.sh')])
             result['browser_exit'] = browser_exit
             if browser_exit:
                 result['publication'] = 'blocked_by_browser'
             else:
-                result['publish_exit'] = invoke(run + ['run', '--publish'] + tracking)
+                result['publish_exit'] = stage('publish', run + ['run', '--publish'] + tracking)
                 result['publication'] = 'finished_check_database_for_actual_submission_result'
         print(json.dumps(result))
         return int(any(result.get(key, 0) != 0 for key in ('upload_exit', 'check_exit', 'browser_exit', 'publish_exit')))

@@ -8,5 +8,5 @@ WorkingDirectory=@PROJECT_ROOT@
 Environment=PYTHONUTF8=1
 Environment=TZ=Asia/Shanghai
 UMask=0077
-ExecStart=/usr/bin/bash @PROJECT_ROOT@/scripts/daily-run.sh --execute
+ExecStart=/usr/bin/bash @PROJECT_ROOT@/scripts/monitor.sh run daily
 TimeoutStartSec=6h

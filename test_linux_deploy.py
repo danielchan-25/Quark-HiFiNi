@@ -77,7 +77,7 @@ class DeploymentTests(unittest.TestCase):
     def test_unit_generation_quotes_custom_project_directory(self):
         template = 'WorkingDirectory=@PROJECT_ROOT@\nExecStart=/usr/bin/bash @PROJECT_ROOT@/scripts/daily-run.sh --execute\n'
         text = timer_installer.render_service(template, PurePosixPath('/home/user/My Project%name'))
-        self.assertIn('WorkingDirectory="/home/user/My Project%%name"', text)
+        self.assertIn('WorkingDirectory=/home/user/My Project%%name\n', text)
         self.assertIn('daily-run.sh" --execute', text)
         self.assertNotIn('@PROJECT_ROOT@', text)
 

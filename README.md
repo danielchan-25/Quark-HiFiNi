@@ -63,7 +63,8 @@ bash scripts/run.sh daily-summary --date YYYY-MM-DD
 ```bash
 bash scripts/install-systemd.sh
 systemctl --user daemon-reload
-systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer
+bash scripts/monitor.sh init
+systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer
 systemctl --user list-timers 'quark-hifini-*'
 journalctl --user -u quark-hifini-daily.service
 ```
@@ -77,8 +78,28 @@ journalctl --user -u quark-hifini-daily.service
 停止定时任务：
 
 ```bash
-systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.timer
+systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer
 ```
+
+## 日志与运行监测
+
+每日任务和总结通过 `scripts/monitor.sh run daily` / `run summary` 记录一次真实执行；上传、预检、浏览器和发布阶段分别记录开始时间、耗时和退出码。标准输出和错误输出保存在 `logs/monitor/<任务>/<日期>/`，每次日志最多三份、每份 10 MiB，保留 30 天；`data/monitor/runs/` 保存运行摘要及对应业务运行 ID、实际提交结果、上传计数和警告类型，保留 90 天。日志经过密钥脱敏，仍属于本机私有运行数据，不提交 Git。
+
+独立巡检每 5 分钟运行，检查两个业务定时器是否启用、计划时间后 10 分钟是否启动、每日任务是否超过 45 分钟、总结是否超过 3 分钟、是否异常中断，以及数据库、未确认提交和磁盘余量。06:00 及 23:55 的计划继续按北京时间执行；跨午夜仍会核对前一晚的总结。执行 `init` 后只观察后续计划，不对迁入的 Windows 历史补跑或补发。
+
+巡检异常沿用 `.env` 的飞书通道，每个日期、任务、异常类型只尝试通知一次；通知结果未知时保留证据，不自动重发。成功提交后其余候选素材处理失败，显示为 `PARTIAL_FAILURE` 警告并保存详情，避免将已有帖子误报为整次发布失败。上传失败、未确认提交和真正执行失败仍告警。监测只记录和通知，不自动重跑上传、发帖或每日总结。
+
+```bash
+# 最近执行、最后巡检和证据路径；不访问外部服务
+bash scripts/monitor.sh status
+# 立即本地巡检，不发送通知
+bash scripts/monitor.sh check
+# 巡检和告警发送结果
+tail -n 30 logs/monitor/watchdog.log
+journalctl --user -u quark-hifini-monitor.service --since today
+```
+
+发现问题时先检查 `data/monitor/last-check.json` 和对应运行 JSON，再按其中的 `log_path` 查询完整日志。`evidence.attempts` 的 `CONFIRMED` 表示确认提交，`UNKNOWN` 表示必须人工核实；不能仅凭非零退出码重跑任务。机器关机时无法实时告警，开机后的巡检会检查观察期内当天及前一天应执行的计划。若巡检自身停止，需通过 `systemctl --user list-timers 'quark-hifini-*'` 及 journal 核对。
 
 ## 迁移与状态
 

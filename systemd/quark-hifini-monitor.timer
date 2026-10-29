@@ -1,0 +1,13 @@
+[Unit]
+Description=Inspect Quark-HiFiNi scheduled tasks every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00 Asia/Shanghai
+OnBootSec=2min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=quark-hifini-monitor.service
+
+[Install]
+WantedBy=timers.target

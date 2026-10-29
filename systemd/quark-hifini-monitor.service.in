@@ -1,0 +1,12 @@
+[Unit]
+Description=Quark-HiFiNi scheduler watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUTF8=1
+Environment=TZ=Asia/Shanghai
+UMask=0077
+ExecStart=/usr/bin/bash @PROJECT_ROOT@/scripts/monitor.sh check --notify
+TimeoutStartSec=5min
