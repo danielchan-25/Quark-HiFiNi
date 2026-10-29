@@ -20,7 +20,7 @@ import traceback
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,19 @@ DAILY_LIMIT = 1
 MAX_FAILURES = 3
 PREVIEW_URL = "https://example.invalid/dry-run-no-share"
 SCHEMA_VERSION = 3
+IS_WINDOWS = os.name == "nt"
+BEIJING = timezone(timedelta(hours=8))
+
+
+def beijing_day_bounds() -> tuple[str, str]:
+    """SQLite timestamps are UTC; the publishing quota always follows Beijing."""
+    midnight = datetime.now(BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tuple(moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                 for moment in (midnight, midnight + timedelta(days=1)))
+
+
+def curl_binary() -> str:
+    return os.getenv("CURL_BIN") or ("curl.exe" if IS_WINDOWS else "curl")
 
 
 class RunLock:
@@ -139,6 +152,10 @@ class LyricsLookupError(FlowError):
     """The selected lyrics provider could not return a verifiable match."""
 
 
+class SubmissionRejectedError(FlowError):
+    """The forum explicitly rejected the request; it did not create a post."""
+
+
 @dataclass(frozen=True)
 class Settings:
     cdp_url: str
@@ -159,8 +176,8 @@ class Settings:
             raise FlowError("TypeSafe 配置无效，请检查 MODE、TIMEOUT、MAX_CALLS 和 MODEL") from exc
         return cls(
             cdp_url=os.getenv("HIFINI_CDP_URL", "http://127.0.0.1:9501").rstrip("/"),
-            quark_dir=Path(os.getenv("QUARK_SKILL_DIR", r"C:\Users\admin\.agents\skills\quarkclouddrive")),
-            git_bash=Path(os.getenv("GIT_BASH", r"D:\Git\bin\bash.exe")),
+            quark_dir=Path(os.getenv("QUARK_SKILL_DIR", str(Path.home() / ".codex" / "skills" / "quarkclouddrive"))).expanduser(),
+            git_bash=Path(os.getenv("BASH_PATH") or os.getenv("GIT_BASH") or shutil.which("bash") or "/bin/bash").expanduser(),
             feishu_webhook=os.getenv("FEISHU_WEBHOOK") or None,
             feishu_secret=os.getenv("FEISHU_SECRET") or None,
             hifini_username=os.getenv("HIFINI_USERNAME") or None,
@@ -263,6 +280,11 @@ class Store:
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_upload_song ON uploads(song_key,status);
+        CREATE TABLE IF NOT EXISTS task_slots (
+          kind TEXT NOT NULL, slot_date TEXT NOT NULL, run_id TEXT NOT NULL,
+          status TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(kind,slot_date)
+        );
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(resources)")}
         for name, definition in {
@@ -376,10 +398,11 @@ class Store:
         return int(self.db.execute("SELECT failure_count FROM resources WHERE id=?", (resource_id,)).fetchone()[0])
 
     def submitted_today(self) -> int:
+        start, end = beijing_day_bounds()
         return int(self.db.execute("""SELECT COUNT(*) FROM (
-            SELECT id FROM resources WHERE submitted_at IS NOT NULL AND date(submitted_at,'localtime')=date('now','localtime')
+            SELECT id FROM resources WHERE submitted_at>=? AND submitted_at<?
             UNION SELECT resource_id FROM submission_attempts WHERE status IN ('UNKNOWN','CONFIRMED')
-            AND date(created_at,'localtime')=date('now','localtime'))""").fetchone()[0])
+            AND created_at>=? AND created_at<?)""", (start, end, start, end)).fetchone()[0])
 
     def begin_submission(self, run_id: str, resource_id: int, title: str) -> int:
         with self.db:
@@ -421,13 +444,13 @@ class Feishu:
 
     def retry_pending(self) -> None:
         if not self.enabled or not self.settings.feishu_webhook: return
-        rows = self.log.store.db.execute("SELECT * FROM alerts WHERE status IN ('FAILED','NOT_CONFIGURED','UNKNOWN') ORDER BY id LIMIT 10").fetchall()
+        rows = self.log.store.db.execute("SELECT * FROM alerts WHERE status IN ('FAILED','NOT_CONFIGURED','UNKNOWN') AND title NOT IN ('每日总结','歌词查询失败','未找到可用歌词，素材已跳过') ORDER BY id LIMIT 10").fetchall()
         for row in rows:
             self.alert(row["title"], row["detail"])
             self.log.store.db.execute("UPDATE alerts SET status='RETRIED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
             self.log.store.db.commit()
 
-    def alert(self, title: str, detail: str) -> bool:
+    def alert(self, title: str, detail: str, *, raw_text: bool = False, max_attempts: int = 3) -> bool:
         db = self.log.store.db
         fingerprint = hashlib.sha256(f"{title}\n{detail}".encode()).hexdigest()
         status = "SENDING" if self.enabled else "SUPPRESSED"
@@ -442,21 +465,20 @@ class Feishu:
         if status != "SENDING":
             self.log.event("WARNING" if status == "NOT_CONFIGURED" else "INFO", "feishu_skipped", reason=status, title=title)
             return status == "DEDUPLICATED"
-        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": f"【Quark-HiFiNi {title}】\n{detail}"}}
+        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": detail if raw_text else f"【Quark-HiFiNi {title}】\n{detail}"}}
         if self.settings.feishu_secret:
             timestamp = str(int(time.time()))
             key = f"{timestamp}\n{self.settings.feishu_secret}".encode()
             payload.update(timestamp=timestamp, sign=base64.b64encode(hmac.new(key, digestmod=hashlib.sha256).digest()).decode())
         last_error = "未知原因"
-        for attempt in range(1, 4):
-            port = str(45000 + uuid.uuid4().int % 4000)
+        for attempt in range(1, max_attempts + 1):
             try:
                 result = execute([
-                    "curl.exe", "--noproxy", "*", "-4", "--ssl-no-revoke", "--local-port", port,
-                    "-fsS", "--connect-timeout", "5", "--max-time", "15",
+                    curl_binary(), "--noproxy", "*", "-4", *(["--ssl-no-revoke"] if IS_WINDOWS else []),
+                    "-fsS", "--connect-timeout", "10", "--max-time", "30",
                     "-H", "Content-Type: application/json", "--data-binary", "@-",
                     self.settings.feishu_webhook,
-                ], input=json.dumps(payload, ensure_ascii=False), timeout=20, operation="飞书告警")
+                ], input=json.dumps(payload, ensure_ascii=False), timeout=35, operation="飞书告警")
                 if result.returncode == 0:
                     response = json.loads(result.stdout)
                     if not isinstance(response, dict): raise ValueError("飞书响应不是对象")
@@ -472,7 +494,7 @@ class Feishu:
             last_error = redact(last_error)
             db.execute("UPDATE alerts SET attempts=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (attempt, last_error, alert_id)); db.commit()
             self.log.event("WARNING", "feishu_retry", title=title, attempt=attempt, error=last_error)
-            if attempt < 3: time.sleep(attempt)
+            if attempt < max_attempts: time.sleep(attempt)
         db.execute("UPDATE alerts SET status='FAILED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (alert_id,)); db.commit()
         self.log.event("ERROR", "feishu_failed", error=last_error, title=title)
         return False
@@ -487,7 +509,7 @@ class Quark:
 
     def _run(self, arguments: list[str], *, timeout: int = 90) -> list[dict[str, Any]]:
         install = self.s.quark_dir / "scripts" / "install.sh"; cli = self.s.quark_dir / "scripts" / "quark-drive.cjs"
-        if not self.s.git_bash.is_file() or not install.is_file() or not cli.is_file(): raise FlowError("夸克 Skill 或 Git Bash 缺失")
+        if not self.s.git_bash.is_file() or not install.is_file() or not cli.is_file(): raise FlowError("夸克 Skill 或 Bash 缺失")
         # A stale localhost proxy prevents the Skill update check (and can
         # make an otherwise healthy Quark login look unavailable).  Keep all
         # other environment settings, but force these local operations direct.
@@ -497,11 +519,16 @@ class Quark:
         direct_env["NODE_OPTIONS"] = (direct_env.get("NODE_OPTIONS", "") + " --dns-result-order=ipv4first").strip()
         # Git Bash curl otherwise follows the intermittently unreachable IPv6
         # address returned for Quark's configuration endpoint on this host.
-        install_command = 'curl(){ command curl -4 --local-port "$QUARK_CURL_LOCAL_PORT" "$@"; }; export -f curl; "$1"'
+        install_command = ('curl(){ command curl -4 --local-port "$QUARK_CURL_LOCAL_PORT" "$@"; }; export -f curl; "$1"'
+                           if IS_WINDOWS else 'curl(){ command curl -4 "$@"; }; export -f curl; "$1"')
         check: subprocess.CompletedProcess[str] | None = None
         for attempt in range(1, 4):
             self.log.event("INFO", "quark_environment_check", command=arguments[0], attempt=attempt)
-            direct_env["QUARK_CURL_LOCAL_PORT"] = str(40000 + uuid.uuid4().int % 5000)
+            # Redirects to the download CDN need a fresh local port while the
+            # configuration connection may still be in TIME_WAIT.
+            first_port = 40000 + uuid.uuid4().int % 5000
+            if IS_WINDOWS:
+                direct_env["QUARK_CURL_LOCAL_PORT"] = f"{first_port}-{first_port + 50}"
             try:
                 check = execute([str(self.s.git_bash), "-c", install_command, "_", str(install).replace('\\', '/')], cwd=self.s.quark_dir, timeout=45, operation="夸克环境自检", env=direct_env)
             except FlowError as exc:
@@ -518,13 +545,24 @@ class Quark:
             detail = next((line.strip() for line in lines if "[error]" in line.lower()), "未知原因")
             raise FlowError(f"夸克 Skill 环境自检失败：{detail}")
         tracked_arguments = list(arguments)
+        install_results = []
+        for line in check.stdout.splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and item.get("type") == "install_result": install_results.append(item)
+        if install_results and install_results[-1].get("success") is True and install_results[-1].get("updated") is True:
+            tracked_arguments.append("--skill-updated")
         if self.session_input and self.session_id:
             tracked_arguments.extend(["--session-input", self.session_input, "--session-id", self.session_id])
         self.log.event("INFO", "quark_command_started", command=arguments[0])
-        result = execute(["node", str(cli), *tracked_arguments], cwd=self.s.quark_dir, timeout=timeout, operation=f"夸克 {arguments[0]}", env=direct_env)
+        result = execute(["node", str(cli), *tracked_arguments], cwd=ROOT, timeout=timeout, operation=f"夸克 {arguments[0]}", env=direct_env)
         try:
             rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
             results = [row for row in rows if isinstance(row, dict) and row.get("type") == "result"]
+            if results and isinstance(results[-1].get("notice"), dict) and results[-1]["notice"].get("text"):
+                self.log.event("INFO", "quark_notice", text=results[-1]["notice"]["text"])
             errors = [row for row in results if row.get("code") not in (0, "0")]
             if arguments[0] == "upload":
                 self.log.event("INFO", "quark_upload_result", response=[row for row in rows if row.get("type") != "progress"])
@@ -621,9 +659,11 @@ class TaskTab:
         stream: socket.socket | None = None
         start = 2 + uuid.uuid4().int % 200
         for offset in range(3):
-            candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            family = socket.AF_INET6 if ":" in (parsed.hostname or "") else socket.AF_INET
+            candidate = socket.socket(family, socket.SOCK_STREAM)
             try:
-                candidate.bind((f"127.0.0.{2 + (start + offset) % 250}", 50000 + uuid.uuid4().int % 10000))
+                if IS_WINDOWS and family == socket.AF_INET:
+                    candidate.bind((f"127.0.0.{2 + (start + offset) % 250}", 50000 + uuid.uuid4().int % 10000))
                 candidate.settimeout(5)
                 candidate.connect((parsed.hostname or "127.0.0.1", parsed.port or 80))
                 stream = candidate
@@ -651,7 +691,7 @@ class TaskTab:
         last_error: Exception | None = None
         for _ in range(3):
             connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5,
-                                                    source_address=(f"127.0.0.{2 + uuid.uuid4().int % 250}", 0))
+                                                    source_address=(f"127.0.0.{2 + uuid.uuid4().int % 250}", 0) if IS_WINDOWS else None)
             try:
                 path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
                 connection.request(method, path, headers={"Connection": "close"})
@@ -692,19 +732,25 @@ class TaskTab:
         return result["result"].get("value")
 
     def go(self, url: str) -> None:
+        previous = self.call("Page.getFrameTree")["frameTree"]["frame"]
         navigation = self.call("Page.navigate", {"url": url})
         if navigation.get("errorText"): raise FlowError(f"页面导航失败：{navigation['errorText']}")
         deadline = time.monotonic() + 20
+        state: dict[str, Any] = {}
         while time.monotonic() < deadline:
             time.sleep(0.25)
             frame = self.call("Page.getFrameTree")["frameTree"]["frame"]
-            if navigation.get("loaderId") and frame.get("loaderId") != navigation["loaderId"]: continue
+            if frame.get("id") != navigation.get("frameId"): continue
+            # A site's automatic verification can reload the document. Accept
+            # its new loader, but never mistake the previous page for this visit.
+            if navigation.get("loaderId") and frame.get("loaderId") == previous.get("loaderId"): continue
             try:
-                if self.evaluate(f"document.readyState === 'complete' && !!document.body && location.hostname === {json.dumps(urlparse(url).hostname)}"):
+                state = self.evaluate("""({ready:document.readyState,body:!!document.body,host:location.hostname,guard:!!document.querySelector('script[src*="/_guard/auto.js"]')})""")
+                if state.get("ready") == "complete" and state.get("body") and state.get("host") == urlparse(url).hostname and not state.get("guard"):
                     return
             except FlowError as exc:
                 if "context" not in str(exc).lower(): raise
-        raise FlowError("页面加载超时或跳转至其他站点")
+        raise FlowError(f"页面加载超时或跳转至其他站点（主机={state.get('host', '未知')}，状态={state.get('ready', '未知')}，自动验证={bool(state.get('guard'))}）")
 
     def wait_for(self, expression: str, error: str) -> None:
         deadline = time.monotonic() + 20
@@ -809,11 +855,24 @@ class HiFiNi:
 
     def submit_and_verify(self, title: str, artist: str, song: str) -> dict[str, Any]:
         # This is only called after the command line explicitly opts in to --publish.
-        self.tab.evaluate("(()=>{const b=[...document.querySelectorAll('button')].find(x=>x.offsetParent!==null&&x.innerText.trim()==='发表主题');if(!b)throw Error('未找到发表主题按钮');b.click();return true})()")
+        self.tab.evaluate("""(()=>{window.__publishResponse=null;window.__publishAlert=null;
+        const original=$.xpost;$.xpost=function(url,data,callback,...rest){return original.call(this,url,data,function(code,message,...args){window.__publishResponse={code:code,message:typeof message==='string'?message:''};return callback.call(this,code,message,...args)},...rest)};
+        window.alert=function(message){window.__publishAlert=String(message)};
+        const b=[...document.querySelectorAll('button')].find(x=>x.offsetParent!==null&&x.innerText.trim()==='发表主题');if(!b)throw Error('未找到发表主题按钮');b.click();return true})()""")
         result = None
         for wait in (2, 4, 8):
             time.sleep(wait)
-            page_text = str(self.tab.evaluate("document.body.innerText"))
+            page = self.tab.evaluate("({text:document.body.innerText,response:window.__publishResponse||null,alert:window.__publishAlert||null})")
+            page_text = str(page.get('text', '')) if isinstance(page, dict) else str(page)
+            response = page.get('response') if isinstance(page, dict) else None
+            if isinstance(response, dict):
+                self.log.event('INFO', 'submission_response', code=response.get('code'), message=response.get('message'))
+                message = str(response.get('message') or '')
+                if '该标题已经被使用' in message: raise DuplicateTitleError(message)
+                code = response.get('code')
+                explicit_field_error = code in {'subject', 'message', 'fid', 'fox_tag', 'tag', 'doctype'}
+                if (isinstance(code, (int, float)) and not isinstance(code, bool) and code > 0) or (isinstance(code, str) and (explicit_field_error or (code.isdigit() and int(code) > 0))):
+                    raise SubmissionRejectedError('HiFiNi 拒绝提交：' + message)
             if "该标题已经被使用，请换其他标题试试" in page_text:
                 raise DuplicateTitleError("HiFiNi 提示标题已被使用")
         # Keep the submission page intact while its asynchronous response settles.
@@ -904,10 +963,9 @@ def mp3_bitrate_label(kbps: float | int | None) -> str:
 
 
 def ffprobe_path() -> str:
-    found = shutil.which("ffprobe")
+    configured = os.getenv("FFPROBE_BIN")
+    found = shutil.which(configured or "ffprobe")
     if found: return found
-    fallback = Path(r"D:\ffmpeg-master-latest-win64-gpl-shared\bin\ffprobe.exe")
-    if fallback.is_file(): return str(fallback)
     raise BitrateProbeError("未安装 ffprobe，无法确认 MP3 码率")
 
 
@@ -1291,7 +1349,6 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
             except NoLyricsError as exc:
                 store.update(record["id"], "SKIPPED_NO_LYRICS", detail=str(exc))
                 store.event(run_id, "WARNING", "resource_skipped_no_lyrics", str(exc), record["id"])
-                notify.alert("未找到可用歌词，素材已跳过", f"{folder['filename']}：{exc}\n已永久跳过，不会自动发布。")
                 log.event("WARNING", "resource_skipped", resource=folder["filename"], reason="no_lyrics")
                 continue
             except LyricsLookupError as exc:
@@ -1300,8 +1357,6 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
                 terminal = failures >= 3
                 if terminal: store.update(record["id"], "SKIPPED_BAIKE_LOOKUP", detail=f"连续失败 {failures} 次：{exc}")
                 store.event(run_id, "WARNING", "lyrics_lookup_failed", str(exc), record["id"])
-                notify.alert("歌词查询失败", f"{folder['filename']}：{exc}（失败 {failures}/3 次）\n" +
-                             ("已停止自动处理。" if terminal else "本次跳过，下次任务重试。"))
                 log.event("WARNING", "resource_skipped", resource=folder["filename"],
                           reason="lyrics_lookup_failed", failures=failures, terminal=terminal)
                 continue
@@ -1316,6 +1371,15 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
                 log.event("WARNING", "resource_skipped", resource=folder["filename"],
                           reason="bitrate_probe_failed", failures=failures, terminal=terminal)
                 continue
+            except SubmissionRejectedError as exc:
+                if args.publish:
+                    durable.db.execute("UPDATE submission_attempts SET status='REJECTED',detail=?,ended_at=CURRENT_TIMESTAMP WHERE run_id=? AND resource_id=? AND status='UNKNOWN'", (redact(str(exc)), run_id, record['id']))
+                    durable.db.commit()
+                store.fail(record['id'], str(exc), 'submission_rejected')
+                log.event('ERROR', 'resource_failed', resource_id=record['id'], error=str(exc))
+                notify.alert('发布被网站拒绝', f"{folder['filename']}：{exc}")
+                outcome = 'PARTIAL_FAILURE'
+                break
             except DuplicateTitleError as exc:
                 store.update(record["id"], "SKIPPED_TITLE_CONFLICT", detail=str(exc))
                 store.event(run_id, "WARNING", "title_conflict_skipped", str(exc), record["id"])
@@ -1373,10 +1437,11 @@ def check_local() -> int:
             integrity = store.db.execute("PRAGMA quick_check").fetchone()[0]
             report = {
                 "database": integrity, "imported_logs": imported, "recovered_runs": recovered,
-                "dependencies": {name: bool(shutil.which(name)) for name in ("node", "curl.exe")},
+                "dependencies": {name: bool(shutil.which(name)) for name in ("node", curl_binary())},
                 "ffprobe": ffprobe_path(),
                 "uploads": dict(store.db.execute("SELECT status,COUNT(*) FROM uploads GROUP BY status").fetchall()),
                 "git_bash": settings.git_bash.is_file(),
+                "bash": settings.git_bash.is_file(),
                 "quark_cli": (settings.quark_dir / "scripts" / "quark-drive.cjs").is_file(),
                 "alerts_configured": bool(settings.feishu_webhook),
                 "typesafe": {"mode": settings.typesafe.mode, "configured": bool(settings.typesafe.api_key),
@@ -1431,8 +1496,13 @@ def cli(argv: list[str] | None = None) -> int:
     upload_mode.add_argument("--dry-run", action="store_true", help="preview only (default)")
     upload.add_argument("--session-input", help=argparse.SUPPRESS)
     upload.add_argument("--session-id", help=argparse.SUPPRESS)
+    upload.add_argument("--slot-date", help="authorized task date YYYY-MM-DD; prevents duplicate slot execution")
     sub.add_parser("test-feishu", help="send one Feishu configuration test")
     sub.add_parser("check", help="local health check and import legacy logs; no network calls")
+    report = sub.add_parser("daily-summary", help="preview combined daily summary; --send sends once per date")
+    report.add_argument("--date", help="Beijing date YYYY-MM-DD (default: today)")
+    report.add_argument("--send", action="store_true")
+    report.add_argument("--retry-undelivered", action="store_true", help="explicitly retry a proven pre-connection failure once")
     resolve = sub.add_parser("resolve-submission", help="record a manually verified uncertain submission; never posts")
     resolve.add_argument("attempt_id", type=int)
     decision = resolve.add_mutually_exclusive_group(required=True)
@@ -1444,6 +1514,9 @@ def cli(argv: list[str] | None = None) -> int:
             if ns.dry_run and ns.publish: parser.error("--dry-run and --publish cannot be used together")
             return run(ns)
         if ns.command == "check": return check_local()
+        if ns.command == "daily-summary":
+            from daily_summary import run_summary
+            return run_summary(ns)
         if ns.command == "upload":
             from uploader import run_upload
             return run_upload(ns)

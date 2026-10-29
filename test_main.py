@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import main as app
@@ -33,6 +34,34 @@ class ProjectTests(unittest.TestCase):
 
     def resource(self):
         return self.store.upsert_resource(self.folder)
+
+    def test_linux_defaults_resolve_native_tools_and_home(self):
+        def which(name):
+            return {'bash': '/usr/bin/bash', 'curl': '/usr/bin/curl', 'ffprobe': '/usr/bin/ffprobe'}.get(name)
+        with patch.dict(os.environ, {}, clear=True), patch.object(app, 'load_dotenv'), patch.object(app, 'IS_WINDOWS', False), patch.object(app.shutil, 'which', side_effect=which), patch.object(app.Path, 'home', return_value=self.root):
+            settings = app.Settings.load()
+            self.assertEqual(settings.quark_dir, self.root / '.codex' / 'skills' / 'quarkclouddrive')
+            self.assertEqual(settings.git_bash, Path('/usr/bin/bash'))
+            self.assertEqual(app.curl_binary(), 'curl')
+            self.assertEqual(app.ffprobe_path(), '/usr/bin/ffprobe')
+
+    def test_beijing_quota_uses_utc_boundary_not_host_timezone(self):
+        row = self.resource()
+        clock = Mock()
+        clock.now.return_value = datetime(2026, 10, 28, 0, 15, tzinfo=timezone(timedelta(hours=8)))
+        with patch.object(app, 'datetime', clock):
+            self.assertEqual(app.beijing_day_bounds(), ('2026-10-27 16:00:00', '2026-10-28 16:00:00'))
+            self.store.db.execute("UPDATE resources SET submitted_at='2026-10-27 15:59:59' WHERE id=?", (row['id'],))
+            self.assertEqual(self.store.submitted_today(), 0)
+            self.store.db.execute("UPDATE resources SET submitted_at='2026-10-27 16:00:00' WHERE id=?", (row['id'],))
+            self.assertEqual(self.store.submitted_today(), 1)
+
+    def test_linux_feishu_command_omits_windows_tls_option(self):
+        result = subprocess.CompletedProcess([], 0, '{"code":0}', '')
+        with patch.object(app, 'IS_WINDOWS', False), patch.dict(os.environ, {}, clear=True), patch.object(app, 'execute', return_value=result) as send:
+            self.assertTrue(app.Feishu(self.alert_settings(), self.log).alert('test', 'detail'))
+        self.assertEqual(send.call_args.args[0][0], 'curl')
+        self.assertNotIn('--ssl-no-revoke', send.call_args.args[0])
 
     def workflow(self, publish=False, folders=None, submit_error=None, draft_error=None):
         quark = Mock()
@@ -368,6 +397,33 @@ class ProjectTests(unittest.TestCase):
             with self.assertRaises(app.DuplicateTitleError): browser.submit_and_verify("title", "Artist", "Song")
         browser.duplicate.assert_not_called()
 
+    def test_explicit_submission_rejection_does_not_search_or_retry(self):
+        browser = self.browser()
+        browser.tab.evaluate.side_effect = [True, {'text': '', 'response': {'code': 'subject', 'message': '标题包含不允许的字符'}}]
+        browser.duplicate = Mock()
+        with patch.object(app.time, 'sleep'):
+            with self.assertRaisesRegex(app.SubmissionRejectedError, '标题包含'):
+                browser.submit_and_verify('title', 'Artist', 'Song')
+        browser.duplicate.assert_not_called()
+
+    def test_negative_transport_response_preserves_unknown_submission(self):
+        browser = self.browser()
+        browser.tab.evaluate.side_effect = [True] + [{'text': '', 'response': {'code': -1, 'message': 'timeout'}}] * 3
+        browser.duplicate = Mock(return_value=None)
+        with patch.object(app.time, 'sleep'):
+            with self.assertRaisesRegex(app.FlowError, '未在我的帖子'):
+                browser.submit_and_verify('title', 'Artist', 'Song')
+        self.assertEqual(browser.duplicate.call_count, 3)
+
+    def test_unclassified_transport_response_preserves_unknown_submission(self):
+        browser = self.browser()
+        browser.tab.evaluate.side_effect = [True] + [{'text': '', 'response': {'code': 'error', 'message': 'timeout'}}] * 3
+        browser.duplicate = Mock(return_value=None)
+        with patch.object(app.time, 'sleep'):
+            with self.assertRaisesRegex(app.FlowError, '未在我的帖子'):
+                browser.submit_and_verify('title', 'Artist', 'Song')
+        self.assertEqual(browser.duplicate.call_count, 3)
+
     def test_share_partial_page_is_not_considered_complete(self):
         quark = app.Quark(self.settings, self.log)
         quark._run = Mock(return_value=[{"type": "result", "data": {"share_info": {"file_num": 2}, "files": [{"filename": "wanted"}]}}])
@@ -407,6 +463,43 @@ class ProjectTests(unittest.TestCase):
             result = app.execute(["node", "-e", "new (require('vm').Script)(require('fs').readFileSync(0,'utf8'));"],
                                  input=expression, timeout=5, operation="JS syntax check")
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class NavigationTests(unittest.TestCase):
+    def tab(self, loaders, states):
+        tab = object.__new__(app.TaskTab)
+        frames = iter(loaders)
+        def call(method, params=None):
+            if method == "Page.navigate":
+                return {"frameId": "main", "loaderId": "requested"}
+            return {"frameTree": {"frame": {"id": "main", "loaderId": next(frames)}}}
+        tab.call = Mock(side_effect=call)
+        tab.evaluate = Mock(side_effect=states)
+        return tab
+
+    def state(self, **overrides):
+        return dict(ready="complete", body=True, host="www.hifini.net", guard=False, **overrides)
+
+    def test_verification_reload_finishes_with_a_different_loader(self):
+        ready = self.state()
+        tab = self.tab(["old", "old", "requested", "reloaded"], [dict(ready, guard=True), ready])
+        with patch.object(app.time, "sleep"), patch.object(app.time, "monotonic", side_effect=range(30)):
+            tab.go("https://www.hifini.net/my-thread.htm")
+        self.assertEqual(tab.evaluate.call_count, 2)
+        self.assertEqual(sum(c.args[0] == "Page.navigate" for c in tab.call.call_args_list), 1)
+
+    def test_previous_document_cannot_count_as_a_successful_visit(self):
+        tab = self.tab(["old"] * 30, [self.state()])
+        with patch.object(app.time, "sleep"), patch.object(app.time, "monotonic", side_effect=range(30)):
+            with self.assertRaises(app.FlowError): tab.go("https://www.hifini.net/my-thread.htm")
+        tab.evaluate.assert_not_called()
+
+    def test_external_redirect_and_persistent_guard_remain_failures(self):
+        for state in [dict(self.state(), host="example.org"), dict(self.state(), guard=True)]:
+            with self.subTest(state=state):
+                tab = self.tab(["old"] + ["reloaded"] * 30, [state] * 30)
+                with patch.object(app.time, "sleep"), patch.object(app.time, "monotonic", side_effect=range(30)):
+                    with self.assertRaises(app.FlowError): tab.go("https://www.hifini.net/my-thread.htm")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,12 @@
+[Unit]
+Description=Send Quark-HiFiNi summary every day at 23:55 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 23:55:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=quark-hifini-summary.service
+
+[Install]
+WantedBy=timers.target

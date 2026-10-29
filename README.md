@@ -1,231 +1,106 @@
 # Quark-HiFiNi
 
-一个面向音乐资源发布场景的本地自动化工具：从夸克网盘的 `Share/Media` 扫描素材，获取百度百科歌词，生成 HiFiNi 发帖草稿，并在人工明确确认后完成发布与后续审核追踪。
+面向 Ubuntu 桌面的 Quark → HiFiNi 自动上传、发布与每日总结工具，使用 Python 工作流完成任务。
 
-项目把目录筛选、分享、歌词查找、格式排版、重复检查和审核跟踪集中为可审计流程，避免重复发帖、错误链接和漏看审核结果。
+这是可配置的独立项目，不携带原设备的数据库、网盘授权、浏览器登录、密钥或定时任务。正式使用前必须完成本机授权和一次预览验收。
 
-## 功能
+## 功能与边界
 
-- 检查夸克登录状态和 `Share/Media` 工作目录。
-- 目录名固定使用“歌手名称 - 歌曲名称”；混合曲自动跳过。
-- 音频文件名含 `Live`、`Remix`、`Cover`、`DJ`、`Acoustic`、`Instrumental`、`Demo`、`Version`、`Edit`、现场、翻唱、伴奏或纯音乐时告警并跳过；同目录多个音频基础名称明显不一致时同样跳过。
-- 英文歌手及英文歌名从 LRCLIB 获取歌词，要求返回的歌手与歌名均精确匹配；中文歌手从百度百科获取歌词。百度百科先搜索“歌手+歌曲”，再回退到纯歌曲名；匹配时忽略大小写、空格、标点和重音符号，例如 `ROSE` 可匹配 `Rosé`。
-- 百度百科只采用同时通过歌手校验且存在“歌曲歌词”章节的词条；两种来源的歌词均逐行显示，无法取得可信歌词时告警并跳过该素材。
-- 根据目录中的音频文件生成标题，例如 `汪苏泷《娱乐时代》[FLAC/MP3-320K]`。
-- MP3 通过 `ffprobe` 读取真实音频流码率；VBR 使用实测平均码率，不将 180K 提高标成 192K；无法确认时停止处理，临时文件检查后立即删除。M4A 的 AAC/ALAC 编码不能靠扩展名判断，需人工确认。
-- 自动创建夸克分享链接；存在提取码时原样填写，不存在时填写“无”。
-- 复用既有分享前检查链接和顶层内容；明确失效或内容不符时重新创建，网络/授权异常时保留原链接并报错。顶层目录名称校验不能替代对目录内部每个文件的验证。
-- 根据歌手名称字符初步选择 HiFiNi 分区：华语、日韩或欧美。这是启发式判断，罗马字拼写的日韩歌手可能被分入欧美，正式发布前需人工检查。
-- 歌词去除来源格式后按行写入，不修改字体和字号；网盘链接放在底部，与歌词保留两行空白，并设为“回复可见”。
-- 每次最多成功提交 1 篇、按本机时区每日硬性上限 1 篇；本机同项目互斥运行，提交前先持久化提交尝试。
-- 若 HiFiNi 明确提示标题已被使用，且素材同时有 FLAC 和 MP3，则只重新分享 MP3，并将标题降级为 `[MP3-码率]` 后再提交一次；不会删除网盘原文件。
-- MP3-only 标题仍冲突时永久跳过；百度百科查询异常和 MP3 码率确认失败会在后续正式任务重试，同阶段连续失败 3 次后停止自动处理。演练不改变正式失败次数。
-- 提交后主题出现在“我的帖子”即记为成功提交；审核结果留待后续任务检查。
-- 每次任务开始复查已提交、审核中和已发布主题；验证码、未登录、无权查看及未知页面保留原状态并告警，不能直接判为审核通过或拒绝。审核中提醒每天最多一次。
-- “我的帖子”分页查重；提交后结果不明确时标记 `SUBMISSION_UNKNOWN`，后续只核实，不自动重发。
-- SQLite 统一保存素材、扫描快照、草稿、分享信息、提交尝试、审核、失败次数、运行日志和告警记录。控制台同步输出进度。
+- 将 `upload-files/` 中命名为 `歌手 - 歌名.mp3` 的文件上传到已配置网盘的 `Share/Media`，保留云端歌曲去重及上传结果未知保护。
+- 核对歌曲与歌词、检查实际 MP3 码率、创建夸克分享并准备 HiFiNi 草稿。只有显式 `--publish` 才会提交。
+- 每个北京时间自然日最多确认提交一篇，结果未知时阻止自动重发。支持人工核实记录、后续审核状态检查。
+- 发布与上传状态合并成每日飞书总结。歌词查询失败只保留日志和总结，不发送即时飞书告警。
+- TypeSafe 可选，只做影子判断；不生成、补写或修改歌词。
 
-## 为什么需要它
+请仅处理自己有权上传、分享和发布的内容。
 
-手工发布音乐资源包含许多容易遗漏的步骤。任一步骤出错都可能造成重复发帖、错误链接或漏看审核结果。本项目将这些约束集中为可重复执行的状态机，同时保留最终发布前的人工确认。
+## Ubuntu 准备
 
-## 环境要求
+基线为 Ubuntu 24.04 LTS、Python 3.12。还需要 Bash、curl、FFmpeg/ffprobe、符合夸克官方 Skill 要求的 Node.js，以及 Google Chrome 或可用的 Chromium 浏览器。
 
-- Windows 10/11
-- Python 3.11+
-- Node.js 16+
-- FFmpeg 中的 `ffprobe`（加入 PATH，用于 MP3 码率检查）和 Windows `curl.exe`（飞书告警）
-- 已安装并授权的夸克网盘官方 Skill
-- Git Bash（默认路径：`D:\Git\bin\bash.exe`）
-- Chrome 已开启远程调试，并登录 HiFiNi；默认 CDP 地址为 `http://127.0.0.1:9501`
-
-## 配置
-
-复制模板并填写真实值：
-
-```powershell
-Copy-Item .env.example .env
+```bash
+git clone https://github.com/danielchan-25/Quark-HiFiNi.git
+cd Quark-HiFiNi
+bash scripts/setup-ubuntu.sh --install-system-packages
+cp .env.example .env
 ```
 
-`.env` 包含以下基础配置，且始终被 Git 忽略；可选配置见 `.env.example`：
+安装脚本只安装系统/Python 依赖并建立本地虚拟环境，不安装浏览器、不替你授权网盘，也不会启用定时发布。若系统依赖已准备好，使用不带参数的 `bash scripts/setup-ubuntu.sh`。
 
-```env
-# 可选：飞书告警
-FEISHU_WEBHOOK=
-FEISHU_SECRET=
+在当前用户的全局 Skill 目录安装夸克网盘官方 Skill，并通过其官方登录流程授权；如目录不同，在 `.env` 设置 `QUARK_SKILL_DIR`。不要将 Skill 的账号配置放进本仓库。填写本机需要的 `.env` 参数，浏览器可用 `BROWSER_BIN` 指定。
 
-# 浏览器会话失效时用于重新登录
-HIFINI_USERNAME=
-HIFINI_PASSWORD=
-
-# 可选：不填时使用 http://127.0.0.1:9501
-HIFINI_CDP_URL=http://127.0.0.1:9501
+```bash
+bash scripts/start-browser.sh
+# 在独立浏览器窗口登录 HiFiNi 后继续
+bash scripts/run.sh check
+bash scripts/run.sh run --dry-run --session-input '检查发布草稿' --session-id "$(date +%s)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
 ```
 
-安装依赖：
+`check` 只检查本机配置、依赖和数据库状态，不证明网络授权可用。草稿预览会读取网盘和歌词网站，并操作本机浏览器；不会正式发布。
 
-```powershell
-python -m pip install -r requirements.txt
+## 手动任务
+
+```bash
+# 上传预览
+bash scripts/run.sh upload --dry-run --session-input '预览音乐上传' --session-id 'UNIX_SECONDS-ABC123'
+
+# 当日正式上传，日期防重复执行
+bash scripts/run.sh upload --apply --slot-date YYYY-MM-DD --session-input '执行音乐上传' --session-id 'UNIX_SECONDS-ABC123'
+
+# 正式发布，一次最多一篇
+bash scripts/run.sh run --publish --session-input '执行一次正式发布' --session-id 'UNIX_SECONDS-ABC123'
+
+# 本地预览每日总结；加 --send 才发送
+bash scripts/run.sh daily-summary --date YYYY-MM-DD
 ```
 
-## 手动部署与运行
+示例中的 `UNIX_SECONDS-ABC123` 必须替换成当轮 Unix 秒时间戳、连字符和六位随机字母数字；同轮所有夸克操作复用该标识，`--session-input` 使用该轮真实指令原文。
 
-先打开固定 Chrome 并登录 HiFiNi、确认夸克 Skill 已授权，然后执行安全演练：
+## 定时运行
 
-```powershell
-python -B main.py run --dry-run
+默认采用 **systemd 用户级 timer**：北京时间 06:00 上传与发布、23:55 每日总结。配置文件随仓库提供，生成到当前用户后仍需手动启用。
+
+```bash
+bash scripts/install-systemd.sh
+systemctl --user daemon-reload
+systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer
+systemctl --user list-timers 'quark-hifini-*'
+journalctl --user -u quark-hifini-daily.service
 ```
 
-演练会读取网盘、查找歌词、必要时下载临时音频以确认码率，并保留本次新建的 Chrome 标签页供人工检查。不会提交帖子、创建夸克分享或发送飞书消息；没有可复用分享时使用明显无效的 `https://example.invalid/dry-run-no-share` 占位链接。业务状态在内存副本中运行，不改变正式素材状态、审核结果或失败次数。演练日志、扫描和草稿快照仍保存进数据库。
+安装器会将当前仓库路径写入用户服务配置。定时器不自动补跑关机期间错过的时段；历史恢复应核实记录后显式执行。机器需要开机，并具备可用用户服务、浏览器和网络环境。桌面退出后的浏览器运行不能仅靠启用 timer 保证。
 
-正式发布只在人工检查草稿并明确允许后执行：
+可见 Chrome 依赖已登录的桌面会话及正确的 `DISPLAY`、`WAYLAND_DISPLAY`、`DBUS_SESSION_BUS_ADDRESS` 等会话环境；必要时在桌面终端执行 `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS`。无桌面或退出登录后需要运行时，应先在本机验证授权可用的 headless 配置，不能把开启 linger 当成浏览器可用的证明。
 
-```powershell
-python -B main.py run --publish
+日常执行入口是 `bash scripts/daily-run.sh --execute`；先运行上传，即使发布被旧未知提交阻止，上传仍可独立完成。正式运行需要准确的任务原文，默认读取 `scripts/daily-task.txt`，可用 `--session-input-file` 指定文件。不要把自动化平台和 systemd 同时配置为正式执行者。
+
+停止定时任务：
+
+```bash
+systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.timer
 ```
 
-正式运行结束时，程序只关闭本次新建的任务标签页，始终保留 Chrome 和既有标签页在线。
+## 迁移与状态
 
-发帖正文中的歌词必须按来源换行逐行分段显示；LRCLIB 与百度百科统一转换为每行一个段落，提交草稿前会校验段落结构和下载区前的空行布局。
+迁移步骤和验收清单见 [docs/MIGRATION.md](docs/MIGRATION.md)。数据库、分享状态、任务日期和总结发送回执应通过私有通道迁移；不要从空库开始后直接对已有素材正式发布。
 
-飞书配置测试：
+本项目将每日额度按北京时间计算。未知提交必须先人工核实；确认已提交时记录真实帖子链接，确认未提交后才能释放保护。没有证据时保留未知状态。
 
-```powershell
-python -B main.py test-feishu
+```bash
+bash scripts/run.sh resolve-submission ATTEMPT_ID --url 'https://www.hifini.net/thread-THREAD_ID.htm'
+# 仅在人工确认未提交后使用：
+bash scripts/run.sh resolve-submission ATTEMPT_ID --not-submitted
 ```
 
-此命令会真实发送一条测试消息。普通离线验证请使用下列命令：
+总结每个日期只尝试发送一次。只有旧记录证明请求尚未发出的 DNS/连接建立失败，且经过明确授权，才可使用 `daily-summary --date YYYY-MM-DD --send --retry-undelivered`；原回执保留，响应丢失或发送中断不会自动重试。
 
-```powershell
-python -B -m unittest -v
-python -B main.py check
+## 测试
+
+```bash
+.venv/bin/python -m unittest discover -v
+find scripts -name '*.sh' -exec bash -n {} \;
 ```
 
-测试使用临时数据库和模拟外部接口，不连接真实浏览器、网盘或飞书，也不发布。`check` 只做本地检查、数据库迁移、历史日志导入和中断记录恢复；输出工具可用性、数据库完整性、状态计数和待核实提交编号，不检测网络登录状态。存在未知提交、缺少依赖或数据库异常时返回非零退出码。
+单元测试模拟网盘、网站和通知，不读取生产认证、不实际上传或发布。GitHub Actions 在 Ubuntu 执行离线测试及 Shell 语法检查；真实账号、浏览器登录、TUN/代理和网站变更仍需部署时验收。
 
-数据库升级前自动生成 `data/quark-hifini.db.before-v版本号-*.db` 备份。历史 JSONL 按文件名、行号和内容摘要去重导入；原文件保留，不再追加新日志。
-
-## 本地音乐上传
-
-固定输入为项目 `upload-files` 目录的直接子文件，仅处理 MP3，不跟随符号链接，不递归本地子目录。文件名须为 `歌手 - 歌名.mp3`。目标为 `Share/Media/歌手 - 歌名/歌手 - 歌名.mp3`；原本地文件保留，不覆盖云端文件。上传与发帖完全独立：上传没有每天/每次数量上限，也不会创建分享或打开论坛。
-
-```powershell
-python -B main.py upload --dry-run
-python -B main.py upload --apply
-```
-
-默认只演练；明确指定 `--apply` 才写入网盘。每日北京时间 06:00 的任务调用上传命令，不调用发布命令。使用本机定时任务时需保持电脑及 Codex 应用运行、项目目录可用。
-
-上传前使用环境变量 PATH 中的 ffprobe，找不到时回退到 `D:\ffmpeg-master-latest-win64-gpl-shared\bin\ffprobe.exe`。确认单个 MP3 音频流、有效时长和实测码率，允许非 320K MP3；发布流程复用同一检查并按实测码率标注，不使用封面/标签造成偏差的总文件码率。这不是完整解码或无损音源鉴定。
-
-去重遍历 `Share/Media`，按歌手与包含版本文字的歌名比较，统一大小写、全半角和连续空格，忽略末尾方括号中的格式/码率标签，保留 Live、Remix、Interlude 等名称内容；不推测歌手别名。云端已有任意支持格式的同曲非空音频就跳过，不补充 FLAC、320K 等音质。云端检测依据文件名、类型和大小，并不下载鉴定每个旧音频。空歌曲目录可复用；内容不符、同名冲突、目录不唯一、查询失败则停止对应上传并告警。
-
-文件修改未满 60 秒或检查中发生变化时留待下次。上传意图先入库，成功后重新浏览并核验文件名和大小。明确发生在上传前的错误下次重试；上传超时、进程中断或核验失败属于结果不明，下次先查云端，找到歌曲则自动对账，仍未找到则请求人工核实，禁止盲目重传。单个文件失败继续其他文件。演练告警只入库；正式上传失败使用已配置飞书告警。
-
-`uploads` 保存每次文件路径、歌曲身份、SHA-256、大小、音频流信息、状态和远端核验结果；`events` 保存过程，`scans` 保存完整网盘快照。扫描根目录失败会终止整次任务，避免将不可访问误当成不存在。没有新文件或全部已存在时正常结束。
-
-## TypeSafe 影子判断（第一阶段）
-
-依据 [TypeSafe API](https://docs.typesafe.ai/api) 接入 Jev 结构化判断，不增加 Python 依赖。三个观察点：音频文件名中的特殊版本标记、百科歌曲/演唱者匹配、歌词逐行分类。AI 不生成或改写歌词，不改变原有筛选、草稿或发布结果；数据库强制 `applied=0`。
-
-在本机 `.env` 添加（不要覆盖已有凭据）：
-
-```env
-TYPESAFE_MODE=shadow
-TYPESAFE_API_KEY=
-TYPESAFE_MODEL=jev-latest
-TYPESAFE_TIMEOUT=15
-TYPESAFE_MAX_CALLS=6
-```
-
-填入自己的 API Key 后，下一次有待处理素材的 `run --dry-run` 即可观察真实判断；已处理素材仍按原规则跳过，不为测试而重新发布。未配置 Key 时记录 `NOT_CONFIGURED` 并继续原流程；`TYPESAFE_MODE=off` 完全关闭判断。`check` 可查看配置是否就绪和判断状态计数，但不会调用 API。
-
-只有目录/音频文件名和公开歌词来源的标题、简介、歌词原文发送到 TypeSafe；不发送网盘文件 ID、分享链接、音频、Cookie 或账号密码。即使演练，配置 Key 后也会产生远端 AI 调用和可能的费用。
-
-每次运行最多 6 次请求（含重试，可设 1–20）；单次连接/读取超时默认 15 秒（可设 1–30）。限流及部分服务端错误最多重试一次，失败后本轮停止后续请求。成功结果按证据、问题、请求模型与提示版本缓存 24 小时；`jev-latest` 的实际模型版本另行保存。最多处理 40 个音频文件、120 行歌词、64 KB 请求，超过时记录 `INPUT_TOO_LARGE`，不截断后猜测。异常、缺少证据、预算耗尽均入库并输出警告事件，不新增飞书消息、不阻断现有规则流程；数据库写入失败仍终止任务。
-
-`ai_judgments` 保存证据、问题、完整概率分布、置信度、原规则结果、实际模型、耗时、请求次数、缓存来源和用量。缓存复用记零新增 token；失败请求的未知用量为 NULL，不能据此视为免费。置信度不是正确率，第一阶段不设置自动放行阈值；应人工核对积累的差异样本后再决定是否启用决策。
-
-## AI / Codex 部署建议
-
-1. 让 AI 仅执行 `--dry-run`，产出可人工审阅的发帖页。
-2. 人工检查标题、分区、歌词、分享链接和“回复可见”设置。
-3. 仅在准备点击“发表主题”时，对该次发布给予明确确认。
-4. 通过任务计划程序按日运行；建议先安排 `--dry-run`，稳定后再由人工触发正式发布。
-
-## 状态说明
-
-| 状态 | 含义 |
-| --- | --- |
-| `PREPARING` | 分享或草稿正在准备，浏览器填表尚未确认成功。 |
-| `DRAFT_READY` | 草稿已生成，尚未提交。演练草稿只记录在 `drafts`，不改正式资源。 |
-| `SUBMISSION_UNKNOWN` | 已记录提交意图，但提交结果尚不确定；禁止自动重发。 |
-| `SUBMITTED` | 主题已出现在“我的帖子”，等待下次任务审核。 |
-| `PENDING_REVIEW` | 主题页显示“该主题正在由管理员审核中……”。 |
-| `PUBLISHED` | 后续检查确认主题页可正常访问。 |
-| `REJECTED` | 主题页明确显示审核失败，永久跳过。无权访问单独作为检查异常。 |
-| `DELETED` | 已发布主题后来显示不存在或已删除，永久跳过。 |
-| `SKIPPED_NO_LYRICS` | 百度百科没有匹配歌词，告警后永久跳过。 |
-| `SKIPPED_BAIKE_LOOKUP` | 百度百科查询连续失败 3 次，停止自动处理。 |
-| `SKIPPED_BITRATE_FAILURE` | MP3 码率连续 3 次无法确认，停止自动处理。 |
-| `SKIPPED_TITLE_CONFLICT` | 原标题和 MP3-only 标题均冲突，永久跳过。 |
-| `FAILED` | 当前处理步骤失败；下次任务才会再次尝试。 |
-| `SKIPPED_TOO_MANY_FAILURES` | 同阶段连续失败达到 3 次，停止自动尝试。 |
-| `SKIPPED_MANUAL_REVIEW` | 混合歌曲、特殊版本或无效目录命名，等待人工处理。 |
-
-运行状态还包括 `PARTIAL_FAILURE`（部分素材或审核检查失败，退出码 1）、`FAILED`（任务失败，退出码 1）及 `ABORTED`（中断，主动 Ctrl+C 返回 130）。无可处理素材会正常结束，并明确记录扫描数和草稿数。
-
-## 异常处置与告警
-
-| 情况 | 程序行为 | 后续处理 |
-| --- | --- | --- |
-| 夸克环境自检超时 | 每次上限 45 秒、最多 3 次，输出每步进度；超时终止相关子进程 | 检查网络和安装环境后再运行 |
-| 网盘命令异常 | 单次上限 90 秒；创建分享等写操作不自动重试 | 查看事件记录；创建分享结果不明时先到网盘核实，可能需要手动复用既有分享 |
-| 浏览器断开/网页变化 | 有界等待、记录调用阶段，保留已有业务状态 | 恢复浏览器或更新页面适配；先演练验证 |
-| 单素材失败 | 记录阶段和错误，继续处理其它素材；同阶段累计 3 次停止 | 修复原因后人工决定是否重置该素材状态 |
-| 点击提交后断线/进程崩溃 | 提交意图已入库；未知结果占用当天名额，阻止新发布 | 下次自动查重核实，仍未知则按下方命令记录人工结论 |
-| 飞书超时、非 JSON 或非成功响应 | 最多尝试 3 次并递增等待；告警失败不覆盖主任务结果 | 入库为 `FAILED`，下次正式运行补发，每次最多处理 10 条积压 |
-| 飞书未配置 | 告警入库为 `NOT_CONFIGURED` | 配置后在正式运行中补发；演练告警 `SUPPRESSED` 不补发 |
-| 同内容重复告警 | 已成功发送的相同标题/正文在 24 小时内去重 | 重试属于尽力投递：远端已收到但本地断线时仍可能重复 |
-| 进程中断 | 操作系统释放互斥锁；下次运行或 `check` 将遗留 `RUNNING` 归为 `ABORTED` | 未知提交保护状态保留；中断期间无法立即发送告警 |
-| 数据库无法写入/磁盘已满 | 终止运行，控制台输出错误，禁止继续提交 | 恢复存储后检查；数据库不可写时无法保证日志入库或告警留痕 |
-
-飞书凭据可不配置加签密钥（取决于机器人安全配置）；不能仅因为 HTTP 成功就认定消息已送达。数据库中的 `alerts` 和 `events` 可核查实际返回与每次重试。
-
-人工核实未知提交后，使用 `check` 返回的 `unresolved_attempt_ids`：
-
-```powershell
-# 已确认帖子存在：用真实的主题地址替换示例
-python -B main.py resolve-submission 123 --url https://www.hifini.net/thread-456.htm
-# 已在网站人工核实确实没有提交：释放未知提交保护
-python -B main.py resolve-submission 123 --not-submitted
-```
-
-这两个命令只记录人工核实结果，不发布帖子。不能把“暂时没查到”当作“确定没提交”。
-
-## 本地数据与隐私
-
-持久业务数据统一存放在 `data/quark-hifini.db`：
-
-| 表 | 用途 |
-| --- | --- |
-| `resources` | 素材、分享链接/提取码、状态、审核结果、失败阶段/次数 |
-| `runs` | 运行模式、开始/结束时间、结果与统计摘要 |
-| `events` | 所有步骤事件、结构化日志、错误堆栈、歌词来源地址；`detail` 保留历史文本或新 JSON |
-| `scans` | 每次目录扫描的完整结果快照 |
-| `drafts` | 标题、分区、歌词 HTML、分享链接、文件列表和实测码率，包括演练草稿 |
-| `submission_attempts` | 每次提交意图、明确拒绝、确认成功、未知结果和人工处置 |
-| `alerts` | 告警正文、投递状态、尝试次数、最终错误和去重指纹 |
-| `imported_logs` | 历史日志导入去重标记 |
-| `ai_judgments` | TypeSafe 影子判断、原始证据与响应、概率、用量、缓存和异常状态 |
-| `uploads` | 本地上传检查、文件摘要、音频流、上传意图和远端核验结果 |
-
-`data/run.lock` 仅用于本机进程互斥，不存业务数据；音频临时文件正常结束时清理。SQLite 使用 WAL，运行中备份应使用 SQLite backup API，勿只复制主 `.db` 而遗漏尚未合并的 WAL。
-
-密码、Webhook 和签名密钥仍只保留在 `.env`/环境变量，不写入数据库。日志会脱敏这些已配置凭据。数据库中包含私人的文件名、分享地址和歌词，仍需保护访问权限。暂不自动删除旧业务记录或日志，以免丢失审核与恢复依据；数据量增大后可按保留期限另做归档。
-
-数据库、日志、`.env`、缓存、虚拟环境和 IDE 文件均不会被推送到 GitHub。请不要在问题反馈、日志或提交信息中粘贴账号密码、WebHook、分享链接或个人资源名称。
-
-## 许可证
-
-本项目采用 [MIT License](LICENSE)。
+MIT License，保留原项目许可证。

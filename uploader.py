@@ -9,6 +9,7 @@ import re
 import time
 import unicodedata
 import uuid
+from datetime import date, datetime, timedelta, timezone
 
 import main as app
 
@@ -170,6 +171,25 @@ def run_upload(args: argparse.Namespace) -> int:
         settings = app.Settings.load()
         store = app.Store()
         run_id = uuid.uuid4().hex
+        slot = getattr(args, 'slot_date', None)
+        if slot:
+            try:
+                parsed_slot = date.fromisoformat(slot)
+                if parsed_slot > datetime.now(timezone(timedelta(hours=8))).date():
+                    raise ValueError('future slot')
+            except ValueError:
+                store.close()
+                raise app.FlowError('上传任务日期须为今天或之前的 YYYY-MM-DD')
+            if not args.apply:
+                store.close()
+                raise app.FlowError('任务日期仅用于正式上传')
+            previous = store.db.execute("SELECT status,run_id FROM task_slots WHERE kind='upload' AND slot_date=?", (slot,)).fetchone()
+            if previous:
+                print(json.dumps({'status': 'already_completed' if previous['status'] == 'SUCCESS' else 'needs_review', 'slot_date': slot, 'run_id': previous['run_id']}))
+                store.close()
+                return 0 if previous['status'] == 'SUCCESS' else 1
+            store.db.execute("INSERT INTO task_slots(kind,slot_date,run_id,status) VALUES('upload',?,?,'RUNNING')", (slot, run_id))
+            store.db.commit()
         log = app.JsonLogger(run_id, store)
         notify = app.Feishu(settings, log, enabled=args.apply)
         store.start_run(run_id, 'upload' if args.apply else 'upload_dry_run')
@@ -178,11 +198,17 @@ def run_upload(args: argparse.Namespace) -> int:
             summary = upload_workflow(args, store, log, quark, notify)
             status = 'PARTIAL_FAILURE' if summary['failed'] else 'SUCCESS'
             store.finish_run(run_id, status, json.dumps(summary, ensure_ascii=False))
+            if slot:
+                store.db.execute("UPDATE task_slots SET status=?,detail=? WHERE kind='upload' AND slot_date=?", (status, json.dumps(summary, ensure_ascii=False), slot))
+                store.db.commit()
             log.event('INFO', 'upload_run_finished', **summary)
             return int(bool(summary['failed']))
         except Exception as exc:
             log.event('ERROR', 'upload_run_failed', error=str(exc))
             store.finish_run(run_id, 'FAILED', str(app.redact(str(exc))))
+            if slot:
+                store.db.execute("UPDATE task_slots SET status='FAILED',detail=? WHERE kind='upload' AND slot_date=?", (app.redact(str(exc)), slot))
+                store.db.commit()
             notify.alert('音乐上传任务失败', str(exc))
             return 1
         except KeyboardInterrupt:

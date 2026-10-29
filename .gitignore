@@ -1,19 +1,38 @@
-# Secrets and local configuration
+# Credentials, authorization and machine-local configuration
 .env
 .env.*
 !.env.example
+.quarkclouddrive/
+.codex/
+config.local.*
+*.pem
+*.key
 
-# Runtime databases, migration backups, lock file and legacy logs.
+# Runtime state is transferred privately, never through the repository
 data/
 logs/
 upload-files/
+browse/
+search/
+artifacts/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
 
-# Python and editor-local files
-__pycache__/
-*.py[cod]
+# Python environments and build/editor files
 .venv/
 venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
+.coverage
+htmlcov/
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
