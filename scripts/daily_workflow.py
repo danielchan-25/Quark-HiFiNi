@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -11,6 +12,24 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def finish(result: dict, workflow_id: str) -> None:
+    result.update(event='workflow_finished', workflow_id=workflow_id,
+                  ended_at=datetime.now(timezone(timedelta(hours=8))).isoformat())
+    print(json.dumps(result), flush=True)
+    path = ROOT / 'data' / 'workflows' / result['date'] / (workflow_id + '.json')
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_suffix('.tmp')
+        with temporary.open('w', encoding='utf-8') as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(result, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except OSError as exc:
+        print(json.dumps({'event': 'workflow_record_unavailable', 'error_type': type(exc).__name__}), flush=True)
 
 
 def invoke(arguments: list[str]) -> int:
@@ -44,6 +63,10 @@ def main() -> int:
     if sys.platform != 'linux':
         parser.error('The Linux scheduled workflow must run on Linux')
     import fcntl
+    workflow_id = os.getenv('QUARK_WORKFLOW_ID') or f'{int(time.time())}-{secrets.token_hex(5)}'
+    # IDs become filenames; external callers cannot inject paths.
+    if not all(char.isalnum() or char in '-_' for char in workflow_id): parser.error('Invalid workflow ID')
+    day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
     session_input = args.session_input_file.read_text(encoding='utf-8')
     if not session_input.strip():
         parser.error('The task instruction file is empty')
@@ -52,9 +75,8 @@ def main() -> int:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(json.dumps({'status': 'already_running'}))
+            finish({'date': day, 'status': 'already_running', 'publication': 'busy'}, workflow_id)
             return 0
-        day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         session_id = f'{int(time.time())}-{secrets.token_hex(3)}'
         run = ['bash', str(ROOT / 'scripts' / 'run.sh')]
         tracking = ['--session-input', session_input, '--session-id', session_id]
@@ -70,7 +92,7 @@ def main() -> int:
             else:
                 result['publish_exit'] = stage('publish', run + ['run', '--publish'] + tracking)
                 result['publication'] = 'finished_check_database_for_actual_submission_result'
-        print(json.dumps(result))
+        finish(result, workflow_id)
         return int(any(result.get(key, 0) != 0 for key in ('upload_exit', 'check_exit', 'browser_exit', 'publish_exit')))
 
 

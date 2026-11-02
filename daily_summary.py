@@ -8,6 +8,7 @@ import sqlite3
 import uuid
 
 import main as app
+import notifications
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -22,7 +23,21 @@ def song_label(artist: str | None, song: str | None, fallback: str = '') -> str:
     return stem or '未识别歌曲'
 
 
-def build_summary(db: sqlite3.Connection, day: date) -> str:
+def workflow_records(root: Path, day: date) -> list[dict]:
+    rows = {}
+    for base in (root / 'data' / 'monitor' / 'runs' / 'daily' / day.isoformat(),
+                 root / 'data' / 'workflows' / day.isoformat()):
+        for path in sorted(base.glob('*.json')):
+            try:
+                row = json.loads(path.read_text(encoding='utf-8'))
+                value = row.get('workflow', row)
+                rows[row.get('workflow_id', row.get('id', path.stem))] = value
+            except (OSError, ValueError, AttributeError):
+                rows[str(path)] = {'publication': 'record_unavailable'}
+    return list(rows.values())
+
+
+def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | None = None) -> str:
     """Reads only; never infers success from a run exit code or current resource status."""
     start = datetime.combine(day, time(), BEIJING).astimezone(timezone.utc)
     bounds = tuple(t.strftime('%Y-%m-%d %H:%M:%S') for t in (start, start + timedelta(days=1)))
@@ -43,6 +58,13 @@ def build_summary(db: sqlite3.Connection, day: date) -> str:
     confirmed = {r['resource_id']: song_label(r['artist'], r['song'], r['folder_name'])
                  for r in attempts if r['status'] == 'CONFIRMED'}
     failures: dict[str, str] = {}
+    blocked = []
+    for workflow in workflows or []:
+        reason = {'blocked_by_preflight': '本地预检未通过', 'blocked_by_browser': '浏览器启动失败',
+                  'record_unavailable': '工作流记录无法读取，需要核查日志'}.get(workflow.get('publication'))
+        if reason:
+            blocked.append(reason)
+            failures['发布前置检查'] = reason
     event_types = ('lyrics_lookup_failed', 'bitrate_probe_failed', 'resource_skipped_no_lyrics',
                    'title_conflict_skipped', 'resource_failed', 'submission_unknown')
     for row in db.execute(
@@ -76,6 +98,9 @@ def build_summary(db: sqlite3.Connection, day: date) -> str:
         "SELECT * FROM uploads WHERE run_id IN (" + ','.join('?' for _ in upload_ids) + ") ORDER BY id", upload_ids)] if upload_ids else []
     uploaded = list(dict.fromkeys(song_label(None, None, r['local_path']) for r in uploads if r['status'] == 'UPLOADED'))
     latest_uploads = {r['local_path']: r for r in uploads}
+    bad_upload_states = ('FAILED', 'UNKNOWN', 'UPLOADING', 'CHECKING')
+    recovered = sum(1 for path, row in latest_uploads.items() if row['status'] in ('UPLOADED', 'SKIPPED_EXISTS')
+                    and any(old['local_path'] == path and old['status'] in bad_upload_states for old in uploads if old['id'] != row['id']))
     upload_failures = []
     for row in latest_uploads.values():
         if row['status'] in ('FAILED', 'UNKNOWN', 'UPLOADING', 'CHECKING'):
@@ -92,7 +117,8 @@ def build_summary(db: sqlite3.Connection, day: date) -> str:
         publication = '进行中，尚无确认提交'
     elif not publish_runs:
         held = db.execute("SELECT a.title FROM submission_attempts a WHERE a.status='UNKNOWN' AND a.created_at<? LIMIT 1", (bounds[1],)).fetchone()
-        publication = '受阻，失败原因：存在旧提交结果待核实（' + held['title'] + '）' if held else '未执行'
+        publication = ('受阻，失败原因：存在旧提交结果待核实（' + held['title'] + '）' if held else
+                       ('受阻，失败原因：' + '；'.join(dict.fromkeys(blocked)) if blocked else '未执行'))
         if held:
             failures['发布任务'] = '旧提交结果待核实，已保留防重发保护：' + held['title']
     elif any(r['status'] in ('FAILED', 'ABORTED', 'PARTIAL_FAILURE') for r in publish_runs):
@@ -100,7 +126,10 @@ def build_summary(db: sqlite3.Connection, day: date) -> str:
     else:
         publication = '无新增发布（达到每日上限或无可用素材）'
 
-    upload_failed = bool(upload_failures) or any(r['status'] in ('FAILED', 'ABORTED', 'PARTIAL_FAILURE') for r in upload_runs)
+    latest_success = max((r['started_at'] for r in upload_runs if r['status'] == 'SUCCESS'), default='')
+    unrecovered_runs = [r for r in upload_runs if r['status'] in ('FAILED', 'ABORTED', 'PARTIAL_FAILURE')
+                        and r['started_at'] >= latest_success]
+    upload_failed = bool(upload_failures) or bool(unrecovered_runs)
     if upload_failed:
         upload = '失败' + ('（部分成功），上传歌曲：' + '；'.join(uploaded) if uploaded else '，上传歌曲：无')
     elif any(r['status'] == 'RUNNING' for r in upload_runs):
@@ -111,6 +140,8 @@ def build_summary(db: sqlite3.Connection, day: date) -> str:
         upload = '成功，无新增上传（已有歌曲已跳过或无待上传文件）'
     else:
         upload = '未执行'
+    if recovered:
+        upload += f'；期间已恢复 {recovered} 项'
     clean = lambda value: ' '.join(str(app.redact(value)).splitlines())
     lines = ['【Quark-HiFiNi】', day.isoformat(), '', '发布任务：' + clean(publication),
              '上传任务：' + clean(upload), '失败任务：']
@@ -133,7 +164,7 @@ def run_summary(args) -> int:
         db.row_factory = sqlite3.Row
         try:
             db.execute('BEGIN')
-            message = build_summary(db, day)
+            message = build_summary(db, day, workflow_records(app.ROOT, day))
         finally:
             db.close()
         if not args.send:
@@ -159,11 +190,11 @@ def run_summary(args) -> int:
             # Read timeouts, lost responses and interrupted attempts remain blocked.
             connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
             try:
-                evidence = connection.execute("SELECT last_error FROM alerts WHERE run_id=? AND title='每日总结' AND status='FAILED' AND attempts=1 ORDER BY id DESC LIMIT 1", (previous.get('run_id'),)).fetchone()
+                connection.row_factory = sqlite3.Row
+                evidence = connection.execute("SELECT * FROM alerts WHERE run_id=? AND title='每日总结' ORDER BY id DESC LIMIT 1", (previous.get('run_id'),)).fetchone()
             finally:
                 connection.close()
-            import re
-            if previous.get('status') != 'UNCONFIRMED' or not evidence or not re.search(r'Resolving timed out|Could not resolve host|Connection timed out|Failed to connect|bind failed|Failed binding', evidence[0] or '', re.I):
+            if previous.get('status') != 'UNCONFIRMED' or not evidence or not notifications.retryable(evidence):
                 raise app.FlowError('无法证明旧消息未发送，禁止补发')
             receipt = directory / (day.isoformat() + '.retry.json')
         # Exclusive creation survives process interruption; uncertain delivery never retries.
@@ -181,8 +212,10 @@ def run_summary(args) -> int:
             run_id = uuid.uuid4().hex
             store.start_run(run_id, 'daily_summary')
             log = app.JsonLogger(run_id, store)
-            sent = app.Feishu(app.Settings.load(), log).alert('每日总结', message, raw_text=True, max_attempts=1)
+            notifier = app.Feishu(app.Settings.load(), log)
+            sent = notifier.alert('每日总结', message, raw_text=True, max_attempts=1)
             record.update(status='SENT' if sent else 'UNCONFIRMED', run_id=run_id)
+            if isinstance(notifier.last_delivery, dict): record['delivery'] = app.redact(notifier.last_delivery)
             temp = receipt.with_suffix('.tmp')
             temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
             temp.replace(receipt)

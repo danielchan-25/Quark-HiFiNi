@@ -64,7 +64,7 @@ bash scripts/run.sh daily-summary --date YYYY-MM-DD
 bash scripts/install-systemd.sh
 systemctl --user daemon-reload
 bash scripts/monitor.sh init
-systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer
+systemctl --user enable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer quark-hifini-backup.timer
 systemctl --user list-timers 'quark-hifini-*'
 journalctl --user -u quark-hifini-daily.service
 ```
@@ -78,7 +78,7 @@ journalctl --user -u quark-hifini-daily.service
 停止定时任务：
 
 ```bash
-systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer
+systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.timer quark-hifini-monitor.timer quark-hifini-backup.timer
 ```
 
 ## 日志与运行监测
@@ -87,7 +87,9 @@ systemctl --user disable --now quark-hifini-daily.timer quark-hifini-summary.tim
 
 独立巡检每 5 分钟运行，检查两个业务定时器是否启用、计划时间后 10 分钟是否启动、每日任务是否超过 45 分钟、总结是否超过 3 分钟、是否异常中断，以及数据库、未确认提交和磁盘余量。06:00 及 23:55 的计划继续按北京时间执行；跨午夜仍会核对前一晚的总结。执行 `init` 后只观察后续计划，不对迁入的 Windows 历史补跑或补发。
 
-巡检异常沿用 `.env` 的飞书通道，每个日期、任务、异常类型只尝试通知一次；通知结果未知时保留证据，不自动重发。成功提交后其余候选素材处理失败，显示为 `PARTIAL_FAILURE` 警告并保存详情，避免将已有帖子误报为整次发布失败。上传失败、未确认提交和真正执行失败仍告警。监测只记录和通知，不自动重跑上传、发帖或每日总结。
+巡检异常沿用 `.env` 的飞书通道，记录发送状态、curl 退出码、远端错误码及脱敏错误原因。明确未发送的通知可间隔 5 分钟有限重试，最多三次；响应丢失、发送中断及旧 UNCONFIRMED 记录不自动重发。成功提交后其余候选素材处理失败，显示为 `PARTIAL_FAILURE` 警告并保存详情。上传失败、未确认提交和真正执行失败仍告警。监测不会自动重跑上传、发帖或每日总结。
+
+日志或监测状态写入失败时，输出降级至 journal，业务子进程继续执行；监测存储问题与真实提交结果分开记录。巡检本身检查不完整时，不把旧故障标记为已恢复。工作流前置失败同时保存到 `data/workflows/`，日报据此报告预检、浏览器等阻断原因；同一文件当天失败后恢复成功，会显示最终状态及恢复数量。网站明确拒绝的素材进入人工处理，旧拒绝记录在下次执行时也会识别，避免重复提交。
 
 ```bash
 # 最近执行、最后巡检和证据路径；不访问外部服务
@@ -103,6 +105,17 @@ journalctl --user -u quark-hifini-monitor.service --since today
 
 ## 迁移与状态
 
+每天北京时间 **03:30** 自动备份，默认保留 **14 天**。使用 SQLite 一致性备份 API，在本地临时目录创建快照后释放业务锁，再传输到 `/mnt/data/backup/Quark-HiFiNi/daily/`。备份包含业务数据库、回执、运行状态、本机 `.env`、源代码和本应用的用户服务配置，不含虚拟环境或浏览器 profile。凭据只进入私有备份，不提交 Git。
+
+每份备份验证成员校验和、远端整包 SHA-256，并在隔离临时目录恢复数据库，检查完整性、外键及各表数量。审计和清单放在 `/mnt/data/record/Quark-HiFiNi/daily-backup/`；`data/backup/last-backup.json` 保存最近结果。监测会检查备份失败、定时器停用以及超过 26 小时没有成功备份。首次部署后可立即运行一次备份验收；其后由 timer 执行。
+
+```bash
+bash scripts/backup.sh                 # 只预览
+bash scripts/backup.sh --execute       # 生成并校验私有备份
+```
+
+恢复备份应在隔离目录检查后进行；不能用旧数据库覆盖已产生的新提交记录来解除防重发保护。
+
 迁移步骤和验收清单见 [docs/MIGRATION.md](docs/MIGRATION.md)。数据库、分享状态、任务日期和总结发送回执应通过私有通道迁移；不要从空库开始后直接对已有素材正式发布。
 
 本项目将每日额度按北京时间计算。未知提交必须先人工核实；确认已提交时记录真实帖子链接，确认未提交后才能释放保护。没有证据时保留未知状态。
@@ -113,7 +126,7 @@ bash scripts/run.sh resolve-submission ATTEMPT_ID --url 'https://www.hifini.net/
 bash scripts/run.sh resolve-submission ATTEMPT_ID --not-submitted
 ```
 
-总结每个日期只尝试发送一次。只有旧记录证明请求尚未发出的 DNS/连接建立失败，且经过明确授权，才可使用 `daily-summary --date YYYY-MM-DD --send --retry-undelivered`；原回执保留，响应丢失或发送中断不会自动重试。
+总结每个日期只尝试发送一次。只有旧记录证明请求尚未发送（例如未配置 webhook 或单次 DNS/连接建立失败），且经过明确授权，才可使用 `daily-summary --date YYYY-MM-DD --send --retry-undelivered`；原回执保留，响应丢失或发送中断不会自动重试。普通通知可用 `retry-alert ALERT_ID` 显式恢复；同样只接受有证据的未发送记录，未知结果会被拒绝。
 
 ## 测试
 

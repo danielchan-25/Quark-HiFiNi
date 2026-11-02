@@ -2,12 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import base64
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import fcntl
-import hashlib
-import hmac
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -24,6 +21,7 @@ import uuid
 
 from dotenv import load_dotenv
 import main as app
+import notifications
 
 ROOT = Path(__file__).resolve().parent
 BEIJING = timezone(timedelta(hours=8))
@@ -72,7 +70,10 @@ def monitor_dir(root: Path) -> Path:
 def logger(path: Path) -> logging.Logger:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     result = logging.Logger(str(path))
-    handler = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=2, encoding='utf-8')
+    class FileHandler(RotatingFileHandler):
+        def handleError(self, record):
+            raise OSError('日志文件写入失败，已降级到 journal')
+    handler = FileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=2, encoding='utf-8')
     os.chmod(path, 0o600)
     handler.setFormatter(logging.Formatter('%(message)s'))
     result.addHandler(handler)
@@ -82,8 +83,28 @@ def logger(path: Path) -> logging.Logger:
 def emit(log: logging.Logger, event: str, **values) -> None:
     row = clean({'time': now().isoformat(timespec='seconds'), 'event': event, **values})
     text = json.dumps(row, ensure_ascii=False)
-    log.info(text)
-    print(text, flush=True)
+    try:
+        log.info(text)
+    except OSError:
+        pass
+    try:
+        print(text, flush=True)
+    except OSError:
+        pass
+
+
+def persist_run(path: Path, record: dict) -> None:
+    try:
+        save(path, record)
+    except OSError as exc:
+        record['observer_state'] = 'DEGRADED'
+        error = clean(f'{type(exc).__name__}: {exc}')
+        if error not in record.setdefault('observer_errors', []):
+            record['observer_errors'].append(error)
+            try:
+                print(json.dumps({'event': 'monitor_storage_error', 'error': error}), file=sys.stderr, flush=True)
+            except OSError:
+                pass
 
 
 def connection(root: Path):
@@ -133,7 +154,7 @@ def evidence(root: Path, previous: set[str], task: str, day: str) -> dict:
 
 def outcome(task: str, code: int, facts: dict) -> str:
     if facts.get('evidence_error'):
-        return 'FAILED'
+        return 'UNKNOWN'
     statuses = Counter(row['status'] for row in facts.get('attempts', []))
     if statuses['UNKNOWN'] or statuses['SUBMITTING']:
         return 'UNKNOWN'
@@ -156,59 +177,92 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
     day = started.date().isoformat()
     identifier = started.strftime('%H%M%S') + '-' + uuid.uuid4().hex[:10]
     directory = monitor_dir(root)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = (directory / (task + '.lock')).open('a+')
+    lock = None
+    storage_error = None
     try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = (directory / (task + '.lock')).open('a+')
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock.close()
         print(json.dumps({'status': 'already_running', 'task': task}))
-        return 1
+        return 0
+    except OSError as exc:
+        storage_error = clean(str(exc))
+        if lock: lock.close()
+        lock = None
     path = directory / 'runs' / task / day / (identifier + '.json')
     log_path = root / 'logs' / 'monitor' / task / day / (identifier + '.log')
-    log = logger(log_path)
+    try:
+        log = logger(log_path)
+    except OSError as exc:
+        log = logging.Logger('monitor-journal-fallback')
+        log.addHandler(logging.NullHandler())
+        storage_error = clean(str(exc))
+        print(json.dumps({'event': 'monitor_log_unavailable', 'error': clean(str(exc))}), file=sys.stderr, flush=True)
     record = {'task': task, 'date': day, 'id': identifier, 'started_at': started.isoformat(),
               'pid': os.getpid(), 'state': 'RUNNING', 'log_path': str(log_path), 'record_path': str(path),
-              'systemd_invocation_id': os.getenv('INVOCATION_ID'), 'last_output_at': None}
+              'systemd_invocation_id': os.getenv('INVOCATION_ID'), 'last_output_at': None, 'observer_state': 'OK'}
+    if storage_error: record.update(observer_state='DEGRADED', observer_errors=[storage_error])
     process = None
     code = 1
     before = None
+    interrupted = False
+    last_saved = time.monotonic()
     try:
-        save(path, record)
+        persist_run(path, record)
         emit(log, 'monitored_task_started', task=task, id=identifier)
-        before = run_ids(root)
+        try:
+            before = run_ids(root)
+        except (OSError, sqlite3.Error) as exc:
+            record.update(observer_state='DEGRADED', observer_errors=[clean(str(exc))])
         if command is None:
             command = (['bash', str(root / 'scripts' / 'daily-run.sh'), '--execute'] if task == 'daily' else
                        ['bash', str(root / 'scripts' / 'run.sh'), 'daily-summary', '--send'])
         process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, encoding='utf-8', errors='replace', bufsize=1,
-                                   env={**os.environ, 'PYTHONUNBUFFERED': '1'}, start_new_session=True)
+                                   env={**os.environ, 'PYTHONUNBUFFERED': '1', 'QUARK_WORKFLOW_ID': identifier}, start_new_session=True)
         record['child_pid'] = process.pid
-        save(path, record)
+        persist_run(path, record)
         for line in process.stdout:
             line = line.rstrip('\r\n')
             try:
                 payload = json.loads(line)
                 line = json.dumps(clean(payload), ensure_ascii=False)
                 if isinstance(payload, dict):
-                    record['last_event'] = payload.get('event', record.get('last_event'))
+                    record['last_event'] = payload.get('event', record.get('last_event')) or ''
                     if payload.get('event') == 'workflow_stage_started':
                         record['stage'] = payload.get('stage', 'unknown')
                         record['stage_started_at'] = payload.get('time', now().isoformat())
+                    if payload.get('event') == 'workflow_finished' or 'publication' in payload:
+                        record['workflow'] = clean(payload)
             except ValueError:
                 line = clean(line)
             # Keep stdout/stderr available even when application initialization fails.
-            log.info('%s %s', now().isoformat(timespec='seconds'), line[:32768])
-            print(line[:32768], flush=True)
+            try:
+                log.info('%s %s', now().isoformat(timespec='seconds'), line[:32768])
+            except OSError as exc:
+                record.update(observer_state='DEGRADED', observer_errors=[clean(str(exc))])
+            try:
+                print(line[:32768], flush=True)
+            except OSError:
+                pass
             record['last_output_at'] = now().isoformat()
-            save(path, record)
+            if time.monotonic() - last_saved >= 5 or record.get('last_event', '').startswith('workflow_'):
+                persist_run(path, record)
+                last_saved = time.monotonic()
         code = process.wait()
     except (OSError, sqlite3.Error, ValueError, KeyboardInterrupt, InterruptedError) as exc:
-        record['error'] = clean(f'{type(exc).__name__}: {exc}')
-        emit(log, 'monitored_task_error', error=record['error'])
-        code = 130 if isinstance(exc, (KeyboardInterrupt, InterruptedError)) else 1
+        interrupted = isinstance(exc, (KeyboardInterrupt, InterruptedError))
+        error = clean(f'{type(exc).__name__}: {exc}')
+        if process is None or interrupted:
+            record['error'] = error
+        else:
+            record.update(observer_state='DEGRADED', observer_errors=[error])
+        emit(log, 'monitored_task_error', error=error)
+        code = 130 if interrupted else 1
     finally:
-        if process is not None and process.poll() is None:
+        if interrupted and process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -218,6 +272,10 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
+        elif process is not None and process.poll() is None:
+            # An observer failure is not authorization to kill the business task.
+            process.communicate()
+            code = process.returncode
         if process is not None and process.stdout is not None:
             process.stdout.close()
         try:
@@ -227,17 +285,21 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
         record.update(state='FINISHED', ended_at=now().isoformat(), exit_code=code,
                       duration_seconds=round((now() - started).total_seconds(), 3))
         record['outcome'] = 'FAILED' if record.get('error') or code < 0 or code == 130 else outcome(task, code, record['evidence'])
-        save(path, record)
+        if record.get('workflow', {}).get('status') == 'already_running':
+            record['outcome'] = 'BUSY'
+        persist_run(path, record)
         emit(log, 'monitored_task_finished', task=task, outcome=record['outcome'], exit_code=code,
              duration_seconds=record['duration_seconds'], record_path=str(path))
         for handler in log.handlers:
             handler.close()
-        lock.close()
+        if lock: lock.close()
     return code
 
 
 def units() -> dict:
     names = [f'quark-hifini-{task}.{kind}' for task in TASKS for kind in ('timer', 'service')]
+    if (read(monitor_dir(ROOT) / 'config.json', {}) or {}).get('backup', {}).get('enabled_at'):
+        names += ['quark-hifini-backup.timer', 'quark-hifini-backup.service']
     result = subprocess.run(['systemctl', '--user', 'show', *names, '-p', 'Id', '-p', 'ActiveState',
                              '-p', 'UnitFileState', '-p', 'Result'], capture_output=True, text=True, timeout=10)
     if result.returncode:
@@ -273,6 +335,8 @@ def inspect(root: Path, at: datetime, config: dict, services: dict) -> tuple[lis
                     problem(f'{day}:{task}:missing', f'{task} 应于 {due.isoformat()} 启动，超过 10 分钟仍无运行记录')
                 continue
             row = max(records, key=lambda r: r['started_at'])
+            if row.get('observer_state') == 'DEGRADED':
+                problem(f'{day}:{task}:observer', f'{task} 日志监测存储降级，业务结果为 {row.get("outcome", "进行中")}', record=row)
             elapsed = (at - datetime.fromisoformat(row['started_at'])).total_seconds()
             if row['state'] == 'RUNNING':
                 if not service_active:
@@ -296,28 +360,25 @@ def inspect(root: Path, at: datetime, config: dict, services: dict) -> tuple[lis
         db.close()
     if shutil.disk_usage(root).free < 1024 ** 3:
         problem(f'{at.date()}:disk', '项目磁盘可用空间少于 1 GiB')
+    backup = config.get('backup', {})
+    if backup.get('enabled_at'):
+        timer = services.get('quark-hifini-backup.timer', {})
+        if timer.get('ActiveState') != 'active' or timer.get('UnitFileState') != 'enabled':
+            problem(f'{at.date()}:backup:timer', '自动备份定时器未启用或未处于 active 状态')
+        state = read(root / 'data' / 'backup' / 'last-backup.json', {})
+        last = state.get('last_success_at') or backup['enabled_at']
+        if (at - datetime.fromisoformat(last)).total_seconds() > 26 * 3600:
+            problem(f'{at.date()}:backup:stale', '超过 26 小时没有已校验成功的自动备份')
+        if state.get('status') == 'FAILED' or services.get('quark-hifini-backup.service', {}).get('ActiveState') == 'failed':
+            problem(f'{at.date()}:backup:failed', '自动备份失败：' + state.get('error', '详见备份记录'))
     return problems, warnings
 
 
-def notify(detail: str) -> str:
+def notify(detail: str) -> dict:
     """One delivery attempt; unknown delivery is retained without automatic replay."""
-    webhook = os.getenv('FEISHU_WEBHOOK')
-    if not webhook:
-        return 'NOT_CONFIGURED'
-    payload = {'msg_type': 'text', 'content': {'text': clean('【Quark-HiFiNi 定时任务监测】\n' + detail)}}
-    secret = os.getenv('FEISHU_SECRET')
-    if secret:
-        stamp = str(int(time.time()))
-        key = f'{stamp}\n{secret}'.encode()
-        payload.update(timestamp=stamp, sign=base64.b64encode(hmac.new(key, digestmod=hashlib.sha256).digest()).decode())
-    try:
-        result = app.execute([app.curl_binary(), '--noproxy', '*', '-4', '-fsS', '--connect-timeout', '10',
-                              '--max-time', '30', '-H', 'Content-Type: application/json', '--data-binary', '@-', webhook],
-                             input=json.dumps(payload, ensure_ascii=False), timeout=35, operation='监测告警')
-        response = json.loads(result.stdout) if result.returncode == 0 else {}
-        return 'SENT' if isinstance(response, dict) and response.get('code', response.get('StatusCode')) in (0, '0') else 'UNCONFIRMED'
-    except (OSError, ValueError, app.FlowError):
-        return 'UNCONFIRMED'
+    return notifications.send_text(os.getenv('FEISHU_WEBHOOK'), os.getenv('FEISHU_SECRET'),
+        '【Quark-HiFiNi 定时任务监测】\n' + detail, execute=app.execute,
+        curl=app.curl_binary(), sanitize=clean)
 
 
 def prune(root: Path, at: datetime) -> None:
@@ -341,15 +402,18 @@ def check(root: Path, send: bool = False) -> int:
         at = now()
         log = logger(root / 'logs' / 'monitor' / 'watchdog.log')
         try:
+            complete = True
             try:
                 problems, warnings = inspect(root, at, config, units())
             except (OSError, sqlite3.Error, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 problems = [{'key': f'{at.date()}:monitor-error', 'detail': clean(f'巡检异常：{type(exc).__name__}: {exc}')}]
                 warnings = []
+                complete = False
             history = read(directory / 'incidents.json', {})
             keys = {row['key'] for row in problems}
             for key, row in history.items():
-                if key not in keys and not row.get('resolved_at'):
+                checked_dates = {str(at.date()), str(at.date() - timedelta(days=1))}
+                if complete and key.split(':', 1)[0] in checked_dates and key not in keys and not row.get('resolved_at'):
                     row['resolved_at'] = at.isoformat()
             for issue in problems:
                 key = issue['key']
@@ -357,9 +421,13 @@ def check(root: Path, send: bool = False) -> int:
                     history[key] = {'first_seen_at': at.isoformat(), 'detail': issue['detail']}
                 incident = history[key]
                 incident.pop('resolved_at', None)
-                if send and not incident.get('notification'):
+                prior = incident.get('notification_result', {})
+                safe_retry = prior.get('status') in ('NOT_SENT', 'NOT_CONFIGURED') and incident.get('notification_attempts', 0) < 3
+                retry_due = not incident.get('retry_after') or at >= datetime.fromisoformat(incident['retry_after'])
+                if send and (not incident.get('notification') or (safe_retry and retry_due)):
                     # Persist the claim before network I/O, including ambiguous crashes.
                     incident['notification'] = 'SENDING'
+                    incident['notification_attempts'] = incident.get('notification_attempts', 0) + 1
                     save(directory / 'incidents.json', history)
                     row = issue.get('record', {})
                     detail = issue['detail'] + '\n' + str(row.get('log_path', root / 'logs' / 'monitor' / 'watchdog.log'))
@@ -368,12 +436,18 @@ def check(root: Path, send: bool = False) -> int:
                         detail += f'\n开始：{row["started_at"]}，阶段：{row.get("stage", "初始化")}，最后事件：{row.get("last_event")}'
                         detail += f'\n本次确认提交 {attempts["CONFIRMED"]} 篇，未确认 {attempts["UNKNOWN"] + attempts["SUBMITTING"]} 篇。'
                     detail += '\n请核对实际提交记录后处理，监测不会自动重跑发布。'
-                    incident['notification'] = notify(detail)
+                    result = notify(detail)
+                    # Preserve compatibility with old delivery records; never replay ambiguous sends.
+                    if isinstance(result, str): result = {'status': result}
+                    incident['notification_result'] = result
+                    incident['notification'] = result['status']
+                    if result['status'] in ('NOT_SENT', 'NOT_CONFIGURED'):
+                        incident['retry_after'] = (at + timedelta(minutes=5)).isoformat()
                     emit(log, 'monitor_notification', key=key, status=incident['notification'])
                 issue['notification'] = incident.get('notification', 'NOT_REQUESTED')
             save(directory / 'incidents.json', history)
             report = {'checked_at': at.isoformat(), 'status': 'ERROR' if problems else ('WARNING' if warnings else 'OK'),
-                      'problems': problems, 'warnings': warnings}
+                      'problems': problems, 'warnings': warnings, 'checks_complete': complete}
             save(directory / 'last-check.json', report)
             emit(log, 'monitor_checked', status=report['status'], problems=len(problems), warnings=len(warnings))
             prune(root, at)

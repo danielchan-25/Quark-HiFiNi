@@ -2,6 +2,7 @@
 from contextlib import redirect_stdout
 import importlib.util
 import io
+import json
 from pathlib import Path, PurePosixPath
 import sys
 import tempfile
@@ -73,6 +74,16 @@ class DeploymentTests(unittest.TestCase):
         code, calls, _ = self.execute_workflow([0, 0, 1])
         self.assertEqual(code, 1)
         self.assertFalse(any('--publish' in call for call in calls))
+
+    def test_browser_failure_is_persisted_for_daily_summary(self):
+        import daily_summary
+        code, calls, _ = self.execute_workflow([0, 0, 1])
+        root = Path(calls[0][1]).parent.parent
+        path = next((root / 'data' / 'workflows').glob('*/*.json'))
+        row = json.loads(path.read_text())
+        from datetime import date
+        self.assertEqual(row['publication'], 'blocked_by_browser')
+        self.assertEqual(daily_summary.workflow_records(root, date.fromisoformat(row['date']))[0]['browser_exit'], 1)
 
     def test_unit_generation_quotes_custom_project_directory(self):
         template = 'WorkingDirectory=@PROJECT_ROOT@\nExecStart=/usr/bin/bash @PROJECT_ROOT@/scripts/daily-run.sh --execute\n'

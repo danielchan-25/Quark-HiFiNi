@@ -177,7 +177,7 @@ class ProjectTests(unittest.TestCase):
         with patch.object(app, "execute", side_effect=app.FlowError("timeout")), patch.object(app.time, "sleep"):
             self.assertFalse(app.Feishu(self.alert_settings(), self.log).alert("error", "detail"))
         row = self.store.db.execute("SELECT * FROM alerts").fetchone()
-        self.assertEqual((row["status"], row["attempts"]), ("FAILED", 3))
+        self.assertEqual((row["status"], row["attempts"]), ("UNKNOWN", 1))
 
     def test_alert_non_json_not_reported_as_success(self):
         result = subprocess.CompletedProcess([], 0, "<html>bad gateway</html>", "")
@@ -229,6 +229,38 @@ class ProjectTests(unittest.TestCase):
         quark.public_share.assert_called_once()
         hifini.submit_and_verify.assert_called_once()
         self.assertEqual(self.store.submitted_today(), 1)
+
+    def test_explicit_site_rejection_is_not_retried_on_next_run(self):
+        code, quark, hifini = self.workflow(True, submit_error=app.SubmissionRejectedError('HiFiNi 拒绝提交：素材需要人工处理'))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.store.db.execute('SELECT status FROM resources').fetchone()[0], 'SKIPPED_MANUAL_REVIEW')
+        self.assertEqual(self.store.db.execute('SELECT status FROM submission_attempts').fetchone()[0], 'REJECTED')
+        self.assertEqual(app.run(argparse.Namespace(publish=True)),0)
+        hifini.submit_and_verify.assert_called_once()
+
+    def test_legacy_rejection_is_recognized_even_after_failure_counter_reset(self):
+        row=self.resource()
+        self.store.db.execute("INSERT INTO submission_attempts(run_id,resource_id,title,status,detail) VALUES('old',?,'title','REJECTED','HiFiNi 拒绝提交：素材需要人工处理')", (row['id'],))
+        self.store.db.commit()
+        code, quark, hifini = self.workflow(True)
+        self.assertEqual(code,0)
+        hifini.submit_and_verify.assert_not_called()
+        quark.public_share.assert_not_called()
+        self.assertEqual(self.store.db.execute('SELECT status FROM resources').fetchone()[0],'SKIPPED_MANUAL_REVIEW')
+
+    def test_ambiguous_alert_is_never_retried_by_next_run(self):
+        result=subprocess.CompletedProcess([],28,'','Operation timed out')
+        with patch.object(app,'execute',return_value=result) as send:
+            app.Feishu(self.alert_settings(),self.log).alert('uncertain','detail')
+            app.Feishu(self.alert_settings(),self.log).retry_pending()
+            app.Feishu(self.alert_settings(),self.log).alert('uncertain','detail')
+            send.assert_called_once()
+
+    def test_unknown_alert_cannot_be_manually_replayed(self):
+        cursor=self.store.db.execute("INSERT INTO alerts(run_id,title,detail,fingerprint,status,attempts) VALUES('old','title','detail','f','UNKNOWN',1)")
+        self.store.db.commit()
+        with self.assertRaisesRegex(app.FlowError,'无法证明'):
+            app.retry_alert(cursor.lastrowid)
 
     def test_daily_cap_prevents_scan_and_submit(self):
         row = self.resource(); self.store.mark_submitted(row["id"], "https://www.hifini.net/thread-1.htm")

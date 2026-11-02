@@ -32,6 +32,7 @@ import websocket
 from dotenv import load_dotenv
 
 from ai_review import ReviewConfig, ShadowReviewer
+import notifications
 
 
 ROOT = Path(__file__).resolve().parent
@@ -441,14 +442,21 @@ class Store:
 class Feishu:
     def __init__(self, settings: Settings, log: JsonLogger, enabled: bool = True) -> None:
         self.settings, self.log, self.enabled = settings, log, enabled
+        self.last_delivery: dict[str, Any] | None = None
 
     def retry_pending(self) -> None:
         if not self.enabled or not self.settings.feishu_webhook: return
-        rows = self.log.store.db.execute("SELECT * FROM alerts WHERE status IN ('FAILED','NOT_CONFIGURED','UNKNOWN') AND title NOT IN ('每日总结','歌词查询失败','未找到可用歌词，素材已跳过') ORDER BY id LIMIT 10").fetchall()
+        rows = self.log.store.db.execute("SELECT * FROM alerts WHERE status IN ('FAILED','NOT_CONFIGURED') AND title NOT IN ('每日总结','歌词查询失败','未找到可用歌词，素材已跳过') ORDER BY id LIMIT 100").fetchall()
+        retried = 0
         for row in rows:
-            self.alert(row["title"], row["detail"])
-            self.log.store.db.execute("UPDATE alerts SET status='RETRIED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            if not notifications.retryable(row): continue
+            if retried >= 10: break
+            # Claim the old record before starting another request; retain its evidence.
+            self.log.store.db.execute("UPDATE alerts SET status='RETRIED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row['id'],))
             self.log.store.db.commit()
+            self.log.event('INFO', 'notification_retry_started', original_alert_id=row['id'])
+            self.alert(row['title'], row['detail'])
+            retried += 1
 
     def alert(self, title: str, detail: str, *, raw_text: bool = False, max_attempts: int = 3) -> bool:
         db = self.log.store.db
@@ -459,44 +467,32 @@ class Feishu:
         if status == "SENDING" and db.execute(
             "SELECT 1 FROM alerts WHERE fingerprint=? AND status='SENT' AND updated_at>datetime('now','-1 day')", (fingerprint,)
         ).fetchone(): status = "DEDUPLICATED"
+        if status == 'SENDING' and db.execute(
+            "SELECT 1 FROM alerts WHERE fingerprint=? AND status IN ('SENDING','UNKNOWN') LIMIT 1", (fingerprint,)
+        ).fetchone(): status = 'BLOCKED_UNKNOWN'
         cursor = db.execute("INSERT INTO alerts(run_id,title,detail,fingerprint,status) VALUES(?,?,?,?,?)",
                             (self.log.run_id, title, redact(detail), fingerprint, status))
         alert_id = cursor.lastrowid; db.commit()
         if status != "SENDING":
+            self.last_delivery = {'delivery_version': 1, 'status': status, 'error': None}
             self.log.event("WARNING" if status == "NOT_CONFIGURED" else "INFO", "feishu_skipped", reason=status, title=title)
             return status == "DEDUPLICATED"
-        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": detail if raw_text else f"【Quark-HiFiNi {title}】\n{detail}"}}
-        if self.settings.feishu_secret:
-            timestamp = str(int(time.time()))
-            key = f"{timestamp}\n{self.settings.feishu_secret}".encode()
-            payload.update(timestamp=timestamp, sign=base64.b64encode(hmac.new(key, digestmod=hashlib.sha256).digest()).decode())
-        last_error = "未知原因"
         for attempt in range(1, max_attempts + 1):
-            try:
-                result = execute([
-                    curl_binary(), "--noproxy", "*", "-4", *(["--ssl-no-revoke"] if IS_WINDOWS else []),
-                    "-fsS", "--connect-timeout", "10", "--max-time", "30",
-                    "-H", "Content-Type: application/json", "--data-binary", "@-",
-                    self.settings.feishu_webhook,
-                ], input=json.dumps(payload, ensure_ascii=False), timeout=35, operation="飞书告警")
-                if result.returncode == 0:
-                    response = json.loads(result.stdout)
-                    if not isinstance(response, dict): raise ValueError("飞书响应不是对象")
-                    if response.get("code", response.get("StatusCode")) not in (0, "0"):
-                        last_error = response.get("msg") or response.get("StatusMessage") or "飞书返回失败"
-                    else:
-                        db.execute("UPDATE alerts SET status='SENT', attempts=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (attempt, alert_id)); db.commit()
-                        self.log.event("INFO", "feishu_sent", title=title, attempt=attempt)
-                        return True
-                else: last_error = result.stderr.strip() or f"curl exit {result.returncode}"
-            except (OSError, FlowError, ValueError) as exc:
-                last_error = str(exc)
-            last_error = redact(last_error)
-            db.execute("UPDATE alerts SET attempts=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (attempt, last_error, alert_id)); db.commit()
-            self.log.event("WARNING", "feishu_retry", title=title, attempt=attempt, error=last_error)
-            if attempt < max_attempts: time.sleep(attempt)
-        db.execute("UPDATE alerts SET status='FAILED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (alert_id,)); db.commit()
-        self.log.event("ERROR", "feishu_failed", error=last_error, title=title)
+            delivery = notifications.send_text(self.settings.feishu_webhook, self.settings.feishu_secret,
+                detail if raw_text else f'【Quark-HiFiNi {title}】\n{detail}', execute=execute,
+                curl=curl_binary(), sanitize=redact, windows=IS_WINDOWS)
+            self.last_delivery = delivery
+            state = delivery['status']
+            status = 'SENT' if state == 'SENT' else ('UNKNOWN' if state == 'UNKNOWN' else 'FAILED')
+            db.execute('UPDATE alerts SET status=?,attempts=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',
+                       (status, attempt, None if state == 'SENT' else json.dumps(delivery, ensure_ascii=False), alert_id)); db.commit()
+            if state == 'SENT':
+                self.log.event('INFO', 'feishu_sent', title=title, attempt=attempt)
+                return True
+            self.log.event('WARNING', 'feishu_delivery_failed', title=title, attempt=attempt, delivery=delivery)
+            if state != 'NOT_SENT' or attempt >= max_attempts: break
+            time.sleep(attempt)
+        self.log.event('ERROR', 'feishu_failed', delivery=self.last_delivery, title=title)
         return False
 
 
@@ -1259,6 +1255,13 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
                 continue
             if record["failure_count"] >= MAX_FAILURES:
                 store.update(record["id"], "SKIPPED_TOO_MANY_FAILURES", detail="连续失败达到 3 次"); continue
+            prior_rejection = store.db.execute(
+                "SELECT detail FROM submission_attempts WHERE resource_id=? AND status='REJECTED' "
+                "AND detail LIKE '%HiFiNi 拒绝提交%' ORDER BY id DESC LIMIT 1", (record['id'],)).fetchone()
+            if prior_rejection:
+                store.update(record['id'], 'SKIPPED_MANUAL_REVIEW', detail=prior_rejection['detail'])
+                log.event('WARNING', 'resource_rejected_needs_review', resource_id=record['id'], reason=prior_rejection['detail'])
+                continue
             if not parse_folder(folder["filename"]):
                 store.update(record["id"], "SKIPPED_MANUAL_REVIEW", detail="目录命名无效或混合歌名，按规则跳过")
                 notify.alert("素材需要人工检查", folder["filename"])
@@ -1376,6 +1379,7 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
                     durable.db.execute("UPDATE submission_attempts SET status='REJECTED',detail=?,ended_at=CURRENT_TIMESTAMP WHERE run_id=? AND resource_id=? AND status='UNKNOWN'", (redact(str(exc)), run_id, record['id']))
                     durable.db.commit()
                 store.fail(record['id'], str(exc), 'submission_rejected')
+                store.update(record['id'], 'SKIPPED_MANUAL_REVIEW', detail=str(exc))
                 log.event('ERROR', 'resource_failed', resource_id=record['id'], error=str(exc))
                 notify.alert('发布被网站拒绝', f"{folder['filename']}：{exc}")
                 outcome = 'PARTIAL_FAILURE'
@@ -1483,6 +1487,27 @@ def resolve_submission(attempt_id: int, url: str | None) -> int:
         finally: store.close()
 
 
+def retry_alert(alert_id: int) -> int:
+    """Explicit recovery for proven non-delivery; never retries UNKNOWN or summaries."""
+    with RunLock():
+        store = Store()
+        try:
+            row = store.db.execute('SELECT * FROM alerts WHERE id=?', (alert_id,)).fetchone()
+            if not row or not notifications.retryable(row): raise FlowError('无法证明旧消息未发送，禁止补发')
+            if row['title'] == '每日总结': raise FlowError('每日总结请使用 daily-summary --send --retry-undelivered，以保留日期回执保护')
+            settings = Settings.load()
+            if not settings.feishu_webhook: raise FlowError('请先配置 FEISHU_WEBHOOK')
+            run_id = uuid.uuid4().hex
+            store.start_run(run_id, 'notification_retry')
+            store.db.execute("UPDATE alerts SET status='RETRIED',updated_at=CURRENT_TIMESTAMP WHERE id=?", (alert_id,)); store.db.commit()
+            log = JsonLogger(run_id, store)
+            log.event('INFO', 'notification_manually_retried', original_alert_id=alert_id)
+            sent = Feishu(settings, log).alert(row['title'], row['detail'], max_attempts=1)
+            store.finish_run(run_id, 'SUCCESS' if sent else 'FAILED', f'原通知 {alert_id}')
+            return 0 if sent else 1
+        finally: store.close()
+
+
 def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Quark → HiFiNi publisher (safe by default)")
     sub = parser.add_subparsers(dest="command", required=True); cmd = sub.add_parser("run", help="scan and prepare at most one draft")
@@ -1499,6 +1524,8 @@ def cli(argv: list[str] | None = None) -> int:
     upload.add_argument("--slot-date", help="authorized task date YYYY-MM-DD; prevents duplicate slot execution")
     sub.add_parser("test-feishu", help="send one Feishu configuration test")
     sub.add_parser("check", help="local health check and import legacy logs; no network calls")
+    retry = sub.add_parser('retry-alert', help='explicitly retry one proven unsent notification; never UNKNOWN')
+    retry.add_argument('alert_id', type=int)
     report = sub.add_parser("daily-summary", help="preview combined daily summary; --send sends once per date")
     report.add_argument("--date", help="Beijing date YYYY-MM-DD (default: today)")
     report.add_argument("--send", action="store_true")
@@ -1514,6 +1541,7 @@ def cli(argv: list[str] | None = None) -> int:
             if ns.dry_run and ns.publish: parser.error("--dry-run and --publish cannot be used together")
             return run(ns)
         if ns.command == "check": return check_local()
+        if ns.command == 'retry-alert': return retry_alert(ns.alert_id)
         if ns.command == "daily-summary":
             from daily_summary import run_summary
             return run_summary(ns)

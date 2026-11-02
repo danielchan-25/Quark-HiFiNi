@@ -168,7 +168,46 @@ raise SystemExit(1)
     def test_notification_handles_non_object_response(self):
         with patch.dict(os.environ, {'FEISHU_WEBHOOK': 'https://example.invalid'}), \
                 patch.object(app, 'execute', return_value=subprocess.CompletedProcess([], 0, '[]', '')):
-            self.assertEqual(monitor.notify('test'), 'UNCONFIRMED')
+            self.assertEqual(monitor.notify('test')['status'], 'UNKNOWN')
+
+    def test_monitor_storage_failure_does_not_terminate_or_reclassify_business(self):
+        original = monitor.save
+        def failed_progress(path, value):
+            if value.get('child_pid'): raise OSError('simulated state disk failure')
+            original(path, value)
+        facts = {'runs': [{'mode': 'publish', 'status': 'SUCCESS'}], 'attempts': [{'status': 'CONFIRMED'}]}
+        output=io.StringIO()
+        with patch.object(monitor, 'save', side_effect=failed_progress), patch.object(monitor, 'evidence', return_value=facts), \
+                patch.object(monitor.os, 'killpg') as kill, redirect_stdout(output):
+            code = monitor.run_task(self.root, 'daily', [sys.executable, '-c', 'print("progress"); print("finished")'])
+        self.assertEqual(code, 0)
+        self.assertIn('"outcome": "SUCCESS"',output.getvalue())
+        kill.assert_not_called()
+        # The failed persistence leaves its initial RUNNING marker for the watchdog;
+        # journal contains the final, successful business result.
+        record = monitor.read(next((monitor.monitor_dir(self.root) / 'runs').glob('*/*/*.json')))
+        self.assertEqual(record['state'], 'RUNNING')
+
+    def test_incomplete_check_does_not_resolve_previous_incidents(self):
+        self.check()
+        with patch.object(monitor, 'units', side_effect=RuntimeError('unavailable')), \
+                patch.object(monitor, 'now', return_value=self.at), redirect_stdout(io.StringIO()):
+            monitor.check(self.root)
+        history = monitor.read(monitor.monitor_dir(self.root) / 'incidents.json')
+        self.assertNotIn('resolved_at', history['2026-10-30:daily:missing'])
+        self.assertFalse(monitor.read(monitor.monitor_dir(self.root) / 'last-check.json')['checks_complete'])
+
+    def test_monitor_retries_only_proven_unsent_with_a_limit(self):
+        with patch.object(monitor, 'notify', return_value={'status': 'NOT_SENT', 'error': 'DNS unavailable'}) as send:
+            self.check(send=True)
+            self.check(send=True)
+            self.assertEqual(send.call_count, 1)
+            for _ in range(4):
+                self.at += timedelta(minutes=5)
+                self.check(send=True)
+            self.assertEqual(send.call_count, 3)
+        row = monitor.read(monitor.monitor_dir(self.root) / 'incidents.json')['2026-10-30:daily:missing']
+        self.assertEqual(row['notification_result']['error'], 'DNS unavailable')
 
     def test_retention_does_not_delete_legacy_logs_or_business_data(self):
         legacy = self.root / 'logs' / 'legacy.jsonl'

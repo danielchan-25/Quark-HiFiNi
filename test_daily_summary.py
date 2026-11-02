@@ -55,6 +55,40 @@ class SummaryTests(unittest.TestCase):
         self.assertIn('上传任务：未执行', text)
         self.assertTrue(text.endswith('- 无'))
 
+    def test_preflight_and_browser_failures_are_visible_without_a_publish_run(self):
+        self.run_row('u', 'upload')
+        for phase in ('blocked_by_preflight', 'blocked_by_browser'):
+            text = report.build_summary(self.db, self.day, [{'publication': phase}])
+            self.assertIn('发布任务：受阻', text)
+            self.assertIn('发布前置检查', text)
+            self.assertNotIn('失败任务：\n- 无', text)
+
+    def test_upload_recovered_later_is_success_with_history(self):
+        self.run_row('old', 'upload', 'PARTIAL_FAILURE')
+        self.run_row('new', 'upload', started='2026-10-14 23:00:00')
+        for run, state in [('old', 'FAILED'), ('new', 'UPLOADED')]:
+            self.db.execute("INSERT INTO uploads(run_id,local_path,status,created_at) VALUES(?,'Singer - Song.mp3',?,'2026-10-14 22:00:00')", (run, state))
+        text = report.build_summary(self.db, self.day)
+        self.assertIn('上传任务：成功', text)
+        self.assertIn('期间已恢复 1 项', text)
+        self.assertNotIn('上传任务：失败', text)
+
+    def test_unconfigured_notification_can_be_explicitly_recovered(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, 'ROOT', Path(directory)), redirect_stdout(io.StringIO()):
+            store = app.Store()
+            store.db.execute("INSERT INTO alerts(run_id,title,detail,fingerprint,status,attempts) VALUES('old','每日总结','x','f','NOT_CONFIGURED',0)")
+            store.db.commit();store.close()
+            folder = Path(directory) / 'data/daily-summaries'
+            folder.mkdir()
+            original = folder / '2026-10-15.json'
+            original.write_text(json.dumps({'status': 'UNCONFIRMED', 'run_id': 'old'}))
+            args = argparse.Namespace(date='2026-10-15',send=True,retry_undelivered=True)
+            with patch.object(app.Settings,'load'), patch.object(app.Feishu,'alert',return_value=True) as send:
+                self.assertEqual(report.run_summary(args),0)
+                self.assertEqual(report.run_summary(args),0)
+                send.assert_called_once()
+            self.assertEqual(json.loads(original.read_text())['status'],'UNCONFIRMED')
+
     def test_delivery_success_or_unknown_never_resends(self):
         for sent in (True, False):
             with self.subTest(sent=sent), tempfile.TemporaryDirectory() as directory, patch.object(app, 'ROOT', Path(directory)), redirect_stdout(io.StringIO()):
