@@ -120,7 +120,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        for key in ("HIFINI_PASSWORD", "FEISHU_SECRET", "FEISHU_WEBHOOK", "TYPESAFE_API_KEY"):
+        for key in ("HIFINI_PASSWORD", "FEISHU_SECRET", "FEISHU_WEBHOOK", "TYPESAFE_API_KEY", "AI_API_KEY"):
             secret = os.getenv(key)
             if secret:
                 value = value.replace(secret, "[REDACTED]")
@@ -174,7 +174,7 @@ class Settings:
         try:
             review_config = ReviewConfig.load()
         except ValueError as exc:
-            raise FlowError("TypeSafe 配置无效，请检查 MODE、TIMEOUT、MAX_CALLS 和 MODEL") from exc
+            raise FlowError('AI 配置无效：' + str(exc)) from exc
         return cls(
             cdp_url=os.getenv("HIFINI_CDP_URL", "http://127.0.0.1:9501").rstrip("/"),
             quark_dir=Path(os.getenv("QUARK_SKILL_DIR", str(Path.home() / ".codex" / "skills" / "quarkclouddrive"))).expanduser(),
@@ -502,6 +502,7 @@ class Quark:
         self.s, self.log = settings, log
         self.session_input = session_input
         self.session_id = session_id
+        self._environment_checked = False
 
     def _run(self, arguments: list[str], *, timeout: int = 90) -> list[dict[str, Any]]:
         install = self.s.quark_dir / "scripts" / "install.sh"; cli = self.s.quark_dir / "scripts" / "quark-drive.cjs"
@@ -517,8 +518,8 @@ class Quark:
         # address returned for Quark's configuration endpoint on this host.
         install_command = ('curl(){ command curl -4 --local-port "$QUARK_CURL_LOCAL_PORT" "$@"; }; export -f curl; "$1"'
                            if IS_WINDOWS else 'curl(){ command curl -4 "$@"; }; export -f curl; "$1"')
-        check: subprocess.CompletedProcess[str] | None = None
-        for attempt in range(1, 4):
+        check: subprocess.CompletedProcess[str] | None = subprocess.CompletedProcess([], 0, '', '') if self._environment_checked else None
+        for attempt in (() if self._environment_checked else range(1, 4)):
             self.log.event("INFO", "quark_environment_check", command=arguments[0], attempt=attempt)
             # Redirects to the download CDN need a fresh local port while the
             # configuration connection may still be in TIME_WAIT.
@@ -540,6 +541,7 @@ class Quark:
             lines = ((check.stderr or "") + "\n" + (check.stdout or "")).splitlines()
             detail = next((line.strip() for line in lines if "[error]" in line.lower()), "未知原因")
             raise FlowError(f"夸克 Skill 环境自检失败：{detail}")
+        self._environment_checked = True
         tracked_arguments = list(arguments)
         install_results = []
         for line in check.stdout.splitlines():
@@ -1448,9 +1450,13 @@ def check_local() -> int:
                 "bash": settings.git_bash.is_file(),
                 "quark_cli": (settings.quark_dir / "scripts" / "quark-drive.cjs").is_file(),
                 "alerts_configured": bool(settings.feishu_webhook),
-                "typesafe": {"mode": settings.typesafe.mode, "configured": bool(settings.typesafe.api_key),
+                "typesafe": {"active": settings.typesafe.provider == 'typesafe', "mode": settings.typesafe.mode,
+                             "configured": settings.typesafe.provider == 'typesafe' and bool(settings.typesafe.api_key),
                              "model": settings.typesafe.model, "max_calls_per_run": settings.typesafe.max_calls,
                              "judgments": dict(store.db.execute("SELECT status,COUNT(*) FROM ai_judgments GROUP BY status").fetchall())},
+                "ai": {"provider": settings.typesafe.provider, "mode": settings.typesafe.mode,
+                       "model": settings.typesafe.model, "configured": bool(settings.typesafe.api_url) if settings.typesafe.provider == 'compatible' else bool(settings.typesafe.api_key),
+                       "timeout": settings.typesafe.timeout, "max_calls_per_run": settings.typesafe.max_calls},
                 "resources": dict(store.db.execute("SELECT status,COUNT(*) FROM resources GROUP BY status").fetchall()),
                 "runs": dict(store.db.execute("SELECT status,COUNT(*) FROM runs GROUP BY status").fetchall()),
                 "unresolved_submissions": store.db.execute("SELECT COUNT(*) FROM submission_attempts WHERE status='UNKNOWN'").fetchone()[0],
@@ -1459,6 +1465,29 @@ def check_local() -> int:
             }
             print(json.dumps(report, ensure_ascii=True, indent=2))
             return 0 if integrity == "ok" and all(report["dependencies"].values()) and report["git_bash"] and report["quark_cli"] and not report["unresolved_submissions"] else 1
+        finally: store.close()
+
+
+def test_ai() -> int:
+    """One real evidence-only AI request; no cloud-drive or forum actions."""
+    with RunLock():
+        settings = Settings.load()
+        if settings.typesafe.mode == 'off': raise FlowError('AI_MODE 已关闭')
+        store = Store()
+        try:
+            run_id = uuid.uuid4().hex
+            store.start_run(run_id, 'ai_test')
+            log = JsonLogger(run_id, store)
+            reviewer = ShadowReviewer(settings.typesafe, log, redact, use_cache=False)
+            reviewer.versions('Test Artist - Test Song', [{'filename': 'Test Artist - Test Song.mp3'},
+                              {'filename': 'Test Artist - Test Song (Live).mp3'}], None)
+            row = store.db.execute('SELECT status,response_model,error,elapsed_ms,input_tokens,output_tokens FROM ai_judgments WHERE run_id=? ORDER BY id DESC LIMIT 1', (run_id,)).fetchone()
+            success = bool(row and row['status'] in ('SUCCESS', 'CACHED'))
+            result = {'run_id': run_id, 'provider': settings.typesafe.provider, 'requested_model': settings.typesafe.model,
+                      **(dict(row) if row else {'status': 'NO_RESULT'})}
+            store.finish_run(run_id, 'SUCCESS' if success else 'FAILED', json.dumps(redact(result), ensure_ascii=False))
+            print(json.dumps(redact(result), ensure_ascii=False))
+            return 0 if success else 1
         finally: store.close()
 
 
@@ -1523,6 +1552,7 @@ def cli(argv: list[str] | None = None) -> int:
     upload.add_argument("--session-id", help=argparse.SUPPRESS)
     upload.add_argument("--slot-date", help="authorized task date YYYY-MM-DD; prevents duplicate slot execution")
     sub.add_parser("test-feishu", help="send one Feishu configuration test")
+    sub.add_parser('test-ai', help='test the configured AI with one real request; no upload or publication')
     sub.add_parser("check", help="local health check and import legacy logs; no network calls")
     retry = sub.add_parser('retry-alert', help='explicitly retry one proven unsent notification; never UNKNOWN')
     retry.add_argument('alert_id', type=int)
@@ -1541,6 +1571,7 @@ def cli(argv: list[str] | None = None) -> int:
             if ns.dry_run and ns.publish: parser.error("--dry-run and --publish cannot be used together")
             return run(ns)
         if ns.command == "check": return check_local()
+        if ns.command == 'test-ai': return test_ai()
         if ns.command == 'retry-alert': return retry_alert(ns.alert_id)
         if ns.command == "daily-summary":
             from daily_summary import run_summary

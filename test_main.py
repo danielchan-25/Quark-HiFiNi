@@ -325,6 +325,18 @@ class ProjectTests(unittest.TestCase):
         quark._run = Mock(side_effect=app.FlowError("errno=41007 share not exist"))
         self.assertFalse(quark.share_is_valid("url", {"name"}))
 
+    def test_quark_checks_install_once_per_workflow_and_update_notice_once(self):
+        (self.root/'scripts').mkdir(exist_ok=True)
+        for path in (self.root/'scripts/install.sh',self.root/'scripts/quark-drive.cjs',self.settings.git_bash):path.write_text('fixture')
+        install=subprocess.CompletedProcess([],0,'{"type":"install_result","success":true,"updated":true}\n','')
+        command=subprocess.CompletedProcess([],0,'{"type":"result","code":0}\n','')
+        quark=app.Quark(self.settings,self.log,'original instruction','1793166560-d1e283')
+        with patch.object(app,'execute',side_effect=[install,command,command]) as invoke:
+            quark._run(['browse']);quark._run(['browse'])
+        self.assertEqual(invoke.call_count,3)
+        self.assertIn('--skill-updated',invoke.call_args_list[1].args[0])
+        self.assertNotIn('--skill-updated',invoke.call_args_list[2].args[0])
+
     def test_share_extra_files_rejected(self):
         quark = app.Quark(self.settings, self.log)
         quark._run = Mock(return_value=[{"type": "result", "data": {"files": [{"filename": "wanted"}, {"filename": "extra"}]}}])
