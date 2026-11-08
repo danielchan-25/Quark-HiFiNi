@@ -233,9 +233,11 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT failure_count FROM resources WHERE id=?", (row["id"],)).fetchone()[0], 0)
 
     def test_uncertain_submission_is_not_retried(self):
-        code, _, hifini = self.workflow(True, submit_error=app.FlowError("connection lost after click"))
+        self.stack.enter_context(patch.dict(os.environ, {'HIFINI_PASSWORD': 'private-test-password'}))
+        code, _, hifini = self.workflow(True, submit_error=app.FlowError("connection lost after click: private-test-password"))
         self.assertEqual(code, 1)
         hifini.submit_and_verify.assert_called_once()
+        self.assertNotIn('private-test-password', self.store.db.execute('SELECT detail FROM resources').fetchone()[0])
         self.assertEqual(self.store.db.execute("SELECT status FROM resources").fetchone()[0], "SUBMISSION_UNKNOWN")
         self.assertEqual(self.store.db.execute("SELECT status FROM runs WHERE mode='publish'").fetchone()[0], 'PENDING_VERIFICATION')
         # The pending attempt consumes today's quota; retrying never clicks again.

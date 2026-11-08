@@ -1408,7 +1408,7 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
             except Exception as exc:
                 unknown = store.db.execute("SELECT 1 FROM submission_attempts WHERE resource_id=? AND status='UNKNOWN'", (record["id"],)).fetchone()
                 if unknown:
-                    detail = '待核实：' + str(exc)
+                    detail = '待核实：' + redact(str(exc))
                     store.update(record['id'], 'SUBMISSION_UNKNOWN', detail=detail, failure_stage='submission_verification')
                     log.event("ERROR", "submission_unknown", resource_id=record["id"], error=str(exc), traceback=traceback.format_exc())
                     notify.alert("歌曲待核实，请确认是否已发布", f"{title}\n{exc}\n已将该歌曲设为待核实，不会自动重发；本次计入当日额度，不影响后续日期处理其他歌曲。")
