@@ -402,15 +402,15 @@ class Store:
         start, end = beijing_day_bounds()
         return int(self.db.execute("""SELECT COUNT(*) FROM (
             SELECT id FROM resources WHERE submitted_at>=? AND submitted_at<?
-            UNION SELECT resource_id FROM submission_attempts WHERE status IN ('UNKNOWN','CONFIRMED')
+            UNION SELECT resource_id FROM submission_attempts WHERE status IN ('UNKNOWN','SUBMITTING','CONFIRMED')
             AND created_at>=? AND created_at<?)""", (start, end, start, end)).fetchone()[0])
 
     def begin_submission(self, run_id: str, resource_id: int, title: str) -> int:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             if self.submitted_today() >= DAILY_LIMIT: raise FlowError("达到每日发布上限")
-            if self.db.execute("SELECT 1 FROM submission_attempts WHERE status='UNKNOWN'").fetchone():
-                raise FlowError("存在提交结果未知的记录，需先核实，禁止自动重发")
+            if self.db.execute("SELECT 1 FROM submission_attempts WHERE resource_id=? AND status IN ('UNKNOWN','SUBMITTING','CONFIRMED')", (resource_id,)).fetchone():
+                raise FlowError("该歌曲已提交或待核实，禁止自动重发")
             cursor = self.db.execute("INSERT INTO submission_attempts(run_id,resource_id,title,status) VALUES(?,?,?,'UNKNOWN')", (run_id, resource_id, title))
             self.db.execute("UPDATE resources SET status='SUBMISSION_UNKNOWN' WHERE id=?", (resource_id,))
             return int(cursor.lastrowid)
@@ -429,9 +429,9 @@ class Store:
     def audit_candidates(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT *, CAST((julianday('now')-julianday(submitted_at))*86400 AS INTEGER) AS pending_seconds FROM resources WHERE status IN ('SUBMITTED','PENDING_REVIEW','PUBLISHED') AND hifini_url IS NOT NULL").fetchall()
 
-    def mark_submitted(self, resource_id: int, url: str) -> None:
+    def mark_submitted(self, resource_id: int, url: str | None) -> None:
         with self.db:
-            self.db.execute("UPDATE resources SET status='SUBMITTED', hifini_url=?, submitted_at=COALESCE((SELECT MIN(created_at) FROM submission_attempts WHERE resource_id=? AND status='UNKNOWN'),CURRENT_TIMESTAMP), failure_count=0, failure_stage=NULL, audit_status='UNVERIFIED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (url, resource_id, resource_id))
+            self.db.execute("UPDATE resources SET status='SUBMITTED', hifini_url=COALESCE(?,hifini_url), submitted_at=COALESCE(submitted_at,(SELECT MIN(created_at) FROM submission_attempts WHERE resource_id=? AND status='UNKNOWN'),CURRENT_TIMESTAMP), failure_count=0, failure_stage=NULL, audit_status='UNVERIFIED', detail='已确认提交，等待审核状态复查', updated_at=CURRENT_TIMESTAMP WHERE id=?", (url, resource_id, resource_id))
             self.db.execute("UPDATE submission_attempts SET status='CONFIRMED', ended_at=CURRENT_TIMESTAMP WHERE resource_id=? AND status='UNKNOWN'", (resource_id,))
 
     def audit(self, resource_id: int, status: str, detail: str) -> None:
@@ -860,7 +860,14 @@ class HiFiNi:
         result = None
         for wait in (2, 4, 8):
             time.sleep(wait)
-            page = self.tab.evaluate("({text:document.body.innerText,response:window.__publishResponse||null,alert:window.__publishAlert||null})")
+            try:
+                page = self.tab.evaluate("({text:document.body?.innerText||'',ready:!!document.body,response:window.__publishResponse||null,alert:window.__publishAlert||null})")
+            except FlowError as exc:
+                if not any(message in str(exc).lower() for message in
+                           ('execution context was destroyed', 'cannot find context', 'inspected target navigated')):
+                    raise
+                self.log.event('WARNING', 'submission_page_loading', error=str(exc))
+                continue
             page_text = str(page.get('text', '')) if isinstance(page, dict) else str(page)
             response = page.get('response') if isinstance(page, dict) else None
             if isinstance(response, dict):
@@ -1229,15 +1236,21 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
         hifini = HiFiNi(settings, log)
         hifini.ensure_logged_in()
         audit_healthy = review_existing_posts(store, hifini, notify, log, run_id)
-        unresolved = store.db.execute("SELECT r.*, a.title FROM resources r JOIN submission_attempts a ON a.resource_id=r.id WHERE a.status='UNKNOWN'").fetchall()
+        unresolved = store.db.execute("SELECT r.*, a.title, a.id AS attempt_id FROM resources r JOIN submission_attempts a ON a.resource_id=r.id WHERE a.status='UNKNOWN'").fetchall()
         for item in unresolved:
-            match = hifini.duplicate(item["title"])
+            try:
+                match = hifini.duplicate(item["title"])
+            except FlowError as exc:
+                match = None
+                log.event('WARNING', 'submission_reconciliation_failed', resource_id=item['id'], error=str(exc))
             if match:
                 store.mark_submitted(item["id"], match["url"])
                 log.event("INFO", "submission_reconciled", resource_id=item["id"])
             else:
-                notify.alert("提交结果待核实", f"{item['folder_name']}：上次提交结果未知，禁止自动重发，请检查我的帖子。")
-                raise FlowError("存在无法核实的提交，已阻止继续发布")
+                detail = f"待核实：提交记录 {item['attempt_id']}，请确认是否已发布；仅跳过该歌曲，其他歌曲继续按每日额度处理。"
+                store.update(item['id'], 'SUBMISSION_UNKNOWN', detail=detail)
+                notify.alert("歌曲待核实，请确认是否已发布", f"{item['title']}\n{detail}")
+                log.event('WARNING', 'submission_pending_verification', resource_id=item['id'], attempt_id=item['attempt_id'])
         if args.publish and store.submitted_today() >= DAILY_LIMIT:
             detail = "今日已提交 1 篇，达到每日发布上限"
             status = "SUCCESS" if audit_healthy else "PARTIAL_FAILURE"
@@ -1395,9 +1408,11 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
             except Exception as exc:
                 unknown = store.db.execute("SELECT 1 FROM submission_attempts WHERE resource_id=? AND status='UNKNOWN'", (record["id"],)).fetchone()
                 if unknown:
+                    detail = '待核实：' + str(exc)
+                    store.update(record['id'], 'SUBMISSION_UNKNOWN', detail=detail, failure_stage='submission_verification')
                     log.event("ERROR", "submission_unknown", resource_id=record["id"], error=str(exc), traceback=traceback.format_exc())
-                    notify.alert("提交结果待核实", f"{folder['filename']}：{exc}\n已阻止自动重发，请核对我的帖子。")
-                    outcome = "FAILED"; break
+                    notify.alert("歌曲待核实，请确认是否已发布", f"{title}\n{exc}\n已将该歌曲设为待核实，不会自动重发；本次计入当日额度，不影响后续日期处理其他歌曲。")
+                    outcome = "PENDING_VERIFICATION"; break
                 failures = store.fail(record["id"], str(exc))
                 if failures >= MAX_FAILURES: store.update(record["id"], "SKIPPED_TOO_MANY_FAILURES")
                 log.event("ERROR", "resource_failed", resource_id=record["id"], failures=failures, error=str(exc), traceback=traceback.format_exc())
@@ -1461,10 +1476,11 @@ def check_local() -> int:
                 "runs": dict(store.db.execute("SELECT status,COUNT(*) FROM runs GROUP BY status").fetchall()),
                 "unresolved_submissions": store.db.execute("SELECT COUNT(*) FROM submission_attempts WHERE status='UNKNOWN'").fetchone()[0],
                 "unresolved_attempt_ids": [row[0] for row in store.db.execute("SELECT id FROM submission_attempts WHERE status='UNKNOWN'")],
+                "unresolved_blocks_other_songs": False,
                 "pending_alerts": store.db.execute("SELECT COUNT(*) FROM alerts WHERE status IN ('FAILED','UNKNOWN','NOT_CONFIGURED')").fetchone()[0],
             }
             print(json.dumps(report, ensure_ascii=True, indent=2))
-            return 0 if integrity == "ok" and all(report["dependencies"].values()) and report["git_bash"] and report["quark_cli"] and not report["unresolved_submissions"] else 1
+            return 0 if integrity == "ok" and all(report["dependencies"].values()) and report["git_bash"] and report["quark_cli"] else 1
         finally: store.close()
 
 
@@ -1491,7 +1507,7 @@ def test_ai() -> int:
         finally: store.close()
 
 
-def resolve_submission(attempt_id: int, url: str | None) -> int:
+def resolve_submission(attempt_id: int, url: str | None, submitted: bool = False) -> int:
     """Record an operator's explicit decision; this never posts anything."""
     if url and (urlparse(url).scheme != "https" or urlparse(url).hostname != "www.hifini.net"
                 or not re.fullmatch(r"/thread-\d+\.htm", urlparse(url).path)):
@@ -1500,16 +1516,21 @@ def resolve_submission(attempt_id: int, url: str | None) -> int:
         store = Store()
         try:
             row = store.db.execute("SELECT * FROM submission_attempts WHERE id=? AND status='UNKNOWN'", (attempt_id,)).fetchone()
+            if not row and url:
+                row = store.db.execute("SELECT a.* FROM submission_attempts a JOIN resources r ON r.id=a.resource_id WHERE a.id=? AND a.status='CONFIRMED' AND r.hifini_url IS NULL", (attempt_id,)).fetchone()
             if not row: raise FlowError("该提交记录不存在或已处理")
             run_id = uuid.uuid4().hex
             store.start_run(run_id, "resolve_submission")
-            if url:
+            if url or submitted:
                 store.mark_submitted(row["resource_id"], url)
+                with store.db:
+                    store.db.execute("UPDATE submission_attempts SET detail='人工确认已发布' WHERE id=?", (attempt_id,))
+                    store.db.execute("UPDATE resources SET detail=? WHERE id=?", ('人工确认已发布' + ('；帖子链接待补充' if not url else '，等待审核状态复查'), row['resource_id']))
             else:
                 with store.db:
                     store.db.execute("UPDATE submission_attempts SET status='NOT_SUBMITTED', detail='人工确认未提交', ended_at=CURRENT_TIMESTAMP WHERE id=?", (attempt_id,))
                     store.db.execute("UPDATE resources SET status='DRAFT_READY', detail='人工确认未提交，可重新准备草稿' WHERE id=?", (row["resource_id"],))
-            store.event(run_id, "WARNING", "submission_manually_resolved", json.dumps({"attempt_id": attempt_id, "submitted": bool(url)}), row["resource_id"])
+            store.event(run_id, "WARNING", "submission_manually_resolved", json.dumps({"attempt_id": attempt_id, "submitted": bool(url or submitted), "url": url}, ensure_ascii=False), row["resource_id"])
             store.finish_run(run_id, "SUCCESS")
             print("提交核实结果已记录；未执行发布。")
             return 0
@@ -1563,6 +1584,7 @@ def cli(argv: list[str] | None = None) -> int:
     resolve = sub.add_parser("resolve-submission", help="record a manually verified uncertain submission; never posts")
     resolve.add_argument("attempt_id", type=int)
     decision = resolve.add_mutually_exclusive_group(required=True)
+    decision.add_argument("--submitted", action="store_true", help="operator confirmed publication; link may be supplied later")
     decision.add_argument("--url", help="confirmed existing HiFiNi thread URL")
     decision.add_argument("--not-submitted", action="store_true", help="operator has verified the post was never submitted")
     ns = parser.parse_args(argv)
@@ -1579,7 +1601,7 @@ def cli(argv: list[str] | None = None) -> int:
         if ns.command == "upload":
             from uploader import run_upload
             return run_upload(ns)
-        if ns.command == "resolve-submission": return resolve_submission(ns.attempt_id, ns.url)
+        if ns.command == "resolve-submission": return resolve_submission(ns.attempt_id, ns.url, ns.submitted)
         return test_feishu()
     except (OSError, sqlite3.Error, FlowError) as exc:
         print(f"操作失败：{redact(str(exc))}", file=sys.stderr, flush=True)

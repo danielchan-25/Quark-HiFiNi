@@ -352,10 +352,10 @@ def inspect(root: Path, at: datetime, config: dict, services: dict) -> tuple[lis
         integrity = db.execute('PRAGMA quick_check(1)').fetchone()[0]
         if integrity != 'ok':
             problem(f'{at.date()}:database', '数据库 quick_check 异常：' + integrity)
-        unknown = db.execute("SELECT a.id FROM submission_attempts a JOIN runs r ON r.id=a.run_id "
+        unknown = db.execute("SELECT a.id,a.title FROM submission_attempts a JOIN runs r ON r.id=a.run_id "
                              "WHERE a.status IN ('UNKNOWN','SUBMITTING') AND r.status!='RUNNING'").fetchall()
         if unknown:
-            problem(f'{at.date()}:unknown-submission', '存在未确认提交，保留防重发保护', attempt_ids=[row[0] for row in unknown])
+            problem(f'{at.date()}:unknown-submission', '歌曲待核实，请确认是否已发布：' + '；'.join(row['title'] for row in unknown) + '。仅跳过这些歌曲，不影响后续日期处理其他歌曲。', attempt_ids=[row['id'] for row in unknown])
     finally:
         db.close()
     if shutil.disk_usage(root).free < 1024 ** 3:

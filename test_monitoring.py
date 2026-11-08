@@ -155,7 +155,9 @@ raise SystemExit(1)
         self.assertEqual(self.store.db.execute("SELECT status FROM submission_attempts").fetchone()[0], 'UNKNOWN')
         self.store.db.execute("UPDATE runs SET status='FAILED'")
         self.store.db.commit()
-        self.assertTrue(any(row['key'].endswith(':unknown-submission') for row in self.inspect()[0]))
+        issue = next(row for row in self.inspect()[0] if row['key'].endswith(':unknown-submission'))
+        self.assertIn('Song', issue['detail'])
+        self.assertIn('不影响后续日期处理其他歌曲', issue['detail'])
 
     def test_wrapper_records_child_termination_as_failure(self):
         with redirect_stdout(io.StringIO()):

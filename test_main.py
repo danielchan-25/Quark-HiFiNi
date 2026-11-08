@@ -140,6 +140,25 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaises(app.FlowError): self.store.begin_submission("test", row["id"], "title")
         self.assertEqual(self.store.submitted_today(), 1)
 
+    def test_old_unknown_only_blocks_its_own_song(self):
+        row = self.resource()
+        attempt = self.store.begin_submission('test', row['id'], 'old title')
+        self.store.db.execute("UPDATE submission_attempts SET created_at=datetime('now','-2 days') WHERE id=?", (attempt,))
+        self.store.db.commit()
+        with self.assertRaisesRegex(app.FlowError, '该歌曲'):
+            self.store.begin_submission('test', row['id'], 'old title')
+        other = self.store.upsert_resource({'fid': 'other', 'filename': 'Artist - Other'})
+        self.store.begin_submission('test', other['id'], 'other title')
+        self.assertEqual(self.store.submitted_today(), 1)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM submission_attempts WHERE status='UNKNOWN'").fetchone()[0], 2)
+
+    def test_unknown_still_consumes_same_day_quota_for_other_songs(self):
+        row = self.resource()
+        self.store.begin_submission('test', row['id'], 'title')
+        other = self.store.upsert_resource({'fid': 'other', 'filename': 'Artist - Other'})
+        with self.assertRaisesRegex(app.FlowError, '每日发布上限'):
+            self.store.begin_submission('test', other['id'], 'other title')
+
     def test_confirmed_submission_counts_once(self):
         row = self.resource()
         self.store.begin_submission("test", row["id"], "title")
@@ -218,10 +237,53 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(code, 1)
         hifini.submit_and_verify.assert_called_once()
         self.assertEqual(self.store.db.execute("SELECT status FROM resources").fetchone()[0], "SUBMISSION_UNKNOWN")
-        # The next run cannot resolve the post, and must not click submit again.
-        code = app.run(argparse.Namespace(publish=True))
-        self.assertEqual(code, 1)
+        self.assertEqual(self.store.db.execute("SELECT status FROM runs WHERE mode='publish'").fetchone()[0], 'PENDING_VERIFICATION')
+        # The pending attempt consumes today's quota; retrying never clicks again.
+        self.assertEqual(app.run(argparse.Namespace(publish=True)), 0)
         hifini.submit_and_verify.assert_called_once()
+
+    def test_next_day_continues_with_another_song_while_old_one_waits(self):
+        row = self.resource()
+        attempt = self.store.begin_submission('test', row['id'], 'old title')
+        self.store.db.execute("UPDATE submission_attempts SET created_at=datetime('now','-2 days') WHERE id=?", (attempt,))
+        self.store.db.commit()
+        other = {'fid': 'other', 'filename': 'Artist - Other'}
+        code, _, hifini = self.workflow(True, folders=[self.folder, other])
+        self.assertEqual(code, 0)
+        hifini.submit_and_verify.assert_called_once()
+        self.assertEqual(self.store.db.execute('SELECT folder_name FROM drafts ORDER BY id DESC LIMIT 1').fetchone()[0], other['filename'])
+        self.assertEqual(self.store.db.execute('SELECT status FROM submission_attempts WHERE id=?', (attempt,)).fetchone()[0], 'UNKNOWN')
+        self.assertEqual(self.store.db.execute('SELECT status FROM resources WHERE id=?', (row['id'],)).fetchone()[0], 'SUBMISSION_UNKNOWN')
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM alerts WHERE title='歌曲待核实，请确认是否已发布'").fetchone()[0], 1)
+
+    def test_old_reconciliation_error_does_not_block_other_songs(self):
+        row = self.resource()
+        attempt = self.store.begin_submission('test', row['id'], 'old title')
+        self.store.db.execute("UPDATE submission_attempts SET created_at=datetime('now','-2 days') WHERE id=?", (attempt,))
+        self.store.db.commit()
+        _, quark, hifini = self.workflow(False, folders=[])
+        quark.media_folders.return_value = [{'fid': 'other', 'filename': 'Artist - Other'}]
+        def lookup(title, *args):
+            if title == 'old title': raise app.FlowError('old post page unavailable')
+            return None
+        hifini.duplicate.side_effect = lookup
+        self.assertEqual(app.run(argparse.Namespace(publish=True)), 0)
+        hifini.submit_and_verify.assert_called_once()
+        self.assertEqual(self.store.db.execute('SELECT status FROM submission_attempts WHERE id=?', (attempt,)).fetchone()[0], 'UNKNOWN')
+
+    def test_preflight_reports_pending_without_blocking(self):
+        row = self.resource()
+        self.store.begin_submission('test', row['id'], 'title')
+        self.settings.git_bash.touch()
+        script = self.settings.quark_dir / 'scripts' / 'quark-drive.cjs'
+        script.parent.mkdir(parents=True)
+        script.touch()
+        output = io.StringIO()
+        with patch.object(app.Settings, 'load', return_value=self.settings), patch.object(app.shutil, 'which', return_value='/usr/bin/tool'), redirect_stdout(output):
+            self.assertEqual(app.check_local(), 0)
+        state = json.loads(output.getvalue())
+        self.assertEqual(state['unresolved_submissions'], 1)
+        self.assertFalse(state['unresolved_blocks_other_songs'])
 
     def test_publish_flow_persists_one_confirmed_attempt(self):
         code, quark, hifini = self.workflow(True)
@@ -413,6 +475,30 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(app.resolve_submission(attempt, "https://www.hifini.net/thread-123.htm"), 0)
         self.assertEqual(self.store.submitted_today(), 1)
         with self.assertRaises(app.FlowError): app.resolve_submission(attempt, None)
+
+    def test_manual_confirmation_without_url_preserves_original_submission_date(self):
+        row = self.resource(); attempt = self.store.begin_submission('test', row['id'], 'title')
+        self.store.db.execute("UPDATE submission_attempts SET created_at='2026-11-04 22:01:25' WHERE id=?", (attempt,))
+        self.store.db.commit()
+        self.assertEqual(app.cli(['resolve-submission', str(attempt), '--submitted']), 0)
+        resource = self.store.db.execute('SELECT * FROM resources WHERE id=?', (row['id'],)).fetchone()
+        self.assertEqual(resource['submitted_at'], '2026-11-04 22:01:25')
+        self.assertEqual(resource['status'], 'SUBMITTED')
+        self.assertIsNone(resource['hifini_url'])
+        self.assertEqual(self.store.db.execute('SELECT status FROM submission_attempts WHERE id=?', (attempt,)).fetchone()[0], 'CONFIRMED')
+        self.assertEqual(app.cli(['resolve-submission', str(attempt), '--url', 'https://www.hifini.net/thread-123.htm']), 0)
+        resource = self.store.db.execute('SELECT * FROM resources WHERE id=?', (row['id'],)).fetchone()
+        self.assertEqual(resource['hifini_url'], 'https://www.hifini.net/thread-123.htm')
+        self.assertEqual(resource['submitted_at'], '2026-11-04 22:01:25')
+
+    def test_submit_verification_tolerates_navigation_without_clicking_again(self):
+        browser = object.__new__(app.HiFiNi); browser.tab = Mock(); browser.log = self.log
+        browser.tab.evaluate.side_effect = [True, app.FlowError('Execution context was destroyed.'), {'ready': False, 'text': ''}, {'ready': True, 'text': '我的帖子'}]
+        match = {'url': 'https://www.hifini.net/thread-123.htm', 'pending': False}
+        with patch.object(browser, 'duplicate', return_value=match), patch.object(app.time, 'sleep'):
+            self.assertEqual(browser.submit_and_verify('title', 'Artist', 'Song'), match)
+        clicks = [call for call in browser.tab.evaluate.call_args_list if 'b.click()' in call.args[0]]
+        self.assertEqual(len(clicks), 1)
 
     def test_manual_resolution_rejects_untrusted_url(self):
         with self.assertRaises(app.FlowError): app.resolve_submission(1, "https://example.com/thread-123.htm")

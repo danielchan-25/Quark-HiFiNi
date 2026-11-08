@@ -55,6 +55,34 @@ class SummaryTests(unittest.TestCase):
         self.assertIn('上传任务：未执行', text)
         self.assertTrue(text.endswith('- 无'))
 
+    def test_old_pending_song_does_not_override_today_success(self):
+        self.run_row('old', 'publish', 'PENDING_VERIFICATION', '2026-10-13 22:00:00')
+        self.run_row('new', 'publish')
+        self.db.execute("INSERT INTO resources(id,folder_fid,folder_name,artist,song,status) VALUES(1,'old','Singer - Old','Singer','Old','SUBMISSION_UNKNOWN'),(2,'new','Singer - New','Singer','New','SUBMITTED')")
+        self.db.execute("INSERT INTO submission_attempts(run_id,resource_id,title,status,created_at) VALUES('old',1,'Old title','UNKNOWN','2026-10-13 22:00:00'),('new',2,'New title','CONFIRMED','2026-10-14 22:00:00')")
+        text = report.build_summary(self.db, self.day)
+        self.assertIn('发布任务：成功，发布歌曲：《New》- Singer', text)
+        self.assertIn('待核实歌曲（仅跳过该歌曲，不影响后续日期的任务）：\n- Old title', text)
+        self.assertNotIn('受阻', text)
+
+    def test_old_pending_is_a_separate_list_when_no_task_ran(self):
+        self.run_row('old', 'publish', 'PENDING_VERIFICATION', '2026-10-13 22:00:00')
+        self.db.execute("INSERT INTO resources(id,folder_fid,folder_name) VALUES(1,'old','Singer - Old')")
+        self.db.execute("INSERT INTO submission_attempts(run_id,resource_id,title,status,created_at) VALUES('old',1,'Old title','UNKNOWN','2026-10-13 22:00:00')")
+        text = report.build_summary(self.db, self.day)
+        self.assertIn('发布任务：未执行', text)
+        self.assertIn('Old title', text)
+        self.assertNotIn('存在旧提交结果待核实', text)
+
+    def test_current_unknown_is_reported_as_waiting_for_confirmation(self):
+        self.run_row('p', 'publish', 'PENDING_VERIFICATION')
+        self.db.execute("INSERT INTO resources(id,folder_fid,folder_name,artist,song,status) VALUES(1,'f','Singer - Song','Singer','Song','SUBMISSION_UNKNOWN')")
+        self.db.execute("INSERT INTO submission_attempts(run_id,resource_id,title,status,created_at) VALUES('p',1,'Song title','UNKNOWN','2026-10-14 22:05:00')")
+        text = report.build_summary(self.db, self.day)
+        self.assertIn('发布任务：待核实，请确认是否已发布', text)
+        self.assertIn('不影响后续日期处理其他歌曲', text)
+        self.assertIn('Song title', text)
+
     def test_preflight_and_browser_failures_are_visible_without_a_publish_run(self):
         self.run_row('u', 'upload')
         for phase in ('blocked_by_preflight', 'blocked_by_browser'):

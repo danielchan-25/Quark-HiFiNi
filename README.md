@@ -99,7 +99,7 @@ journalctl --user -u quark-hifini-daily.service
 
 可见 Chrome 依赖已登录的桌面会话及正确的 `DISPLAY`、`WAYLAND_DISPLAY`、`DBUS_SESSION_BUS_ADDRESS` 等会话环境；必要时在桌面终端执行 `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS`。无桌面或退出登录后需要运行时，应先在本机验证授权可用的 headless 配置，不能把开启 linger 当成浏览器可用的证明。
 
-日常执行入口是 `bash scripts/daily-run.sh --execute`；先运行上传，即使发布被旧未知提交阻止，上传仍可独立完成。正式运行需要准确的任务原文，默认读取 `scripts/daily-task.txt`，可用 `--session-input-file` 指定文件。不要把自动化平台和 systemd 同时配置为正式执行者。
+日常执行入口是 `bash scripts/daily-run.sh --execute`；先运行上传，再检查本机运行环境。未确认提交只隔离对应歌曲，不阻止后续日期处理其他歌曲。正式运行需要准确的任务原文，默认读取 `scripts/daily-task.txt`，可用 `--session-input-file` 指定文件。不要把自动化平台和 systemd 同时配置为正式执行者。
 
 停止定时任务：
 
@@ -144,10 +144,14 @@ bash scripts/backup.sh --execute       # 生成并校验私有备份
 
 迁移步骤和验收清单见 [docs/MIGRATION.md](docs/MIGRATION.md)。数据库、分享状态、任务日期和总结发送回执应通过私有通道迁移；不要从空库开始后直接对已有素材正式发布。
 
-本项目将每日额度按北京时间计算。未知提交必须先人工核实；确认已提交时记录真实帖子链接，确认未提交后才能释放保护。没有证据时保留未知状态。
+本项目将每日额度按北京时间计算。未确认提交的歌曲进入“待核实”（资源状态 `SUBMISSION_UNKNOWN`，提交记录 `UNKNOWN`），立即通过飞书告警请用户确认。该歌曲不会自动重发，未确认提交仍占用提交当天的额度；后续日期可正常处理其他歌曲。`check` 会列出待核实记录，但不因它们单独返回失败。日报单独列出待核实歌曲，监测持续告警，均不自动重跑发布。
+
+确认已发布时记录真实帖子链接；用户已确认但暂时没有链接时可使用 `--submitted`，保留原提交日期，随后补充链接。只有人工明确确认未发布后，才能解除该歌曲的保护。没有证据时保留待核实状态。
 
 ```bash
 bash scripts/run.sh resolve-submission ATTEMPT_ID --url 'https://www.hifini.net/thread-THREAD_ID.htm'
+# 用户确认已发布，暂时没有链接：
+bash scripts/run.sh resolve-submission ATTEMPT_ID --submitted
 # 仅在人工确认未提交后使用：
 bash scripts/run.sh resolve-submission ATTEMPT_ID --not-submitted
 ```

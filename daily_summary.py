@@ -87,7 +87,7 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
         failures[label] = str(payload.get('error') or detail)
     unknown = [r for r in attempts if r['status'] in ('UNKNOWN', 'SUBMITTING')]
     for row in unknown:
-        failures[song_label(row['artist'], row['song'], row['folder_name'])] = '提交结果未确认，禁止自动重发'
+        failures[song_label(row['artist'], row['song'], row['folder_name'])] = '待核实，请确认是否已发布；仅该歌曲禁止自动重发'
     for run in runs:
         if run['status'] in ('FAILED', 'ABORTED'):
             label = '发布任务' if run['mode'] == 'publish' else '上传任务'
@@ -110,17 +110,13 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
             upload_failures.append(reason)
 
     if unknown:
-        publication = '失败，失败原因：提交结果待核实'
+        publication = '待核实，请确认是否已发布；不影响后续日期处理其他歌曲'
     elif confirmed:
         publication = '成功，发布歌曲：' + '；'.join(confirmed.values())
     elif any(r['status'] == 'RUNNING' for r in publish_runs):
         publication = '进行中，尚无确认提交'
     elif not publish_runs:
-        held = db.execute("SELECT a.title FROM submission_attempts a WHERE a.status='UNKNOWN' AND a.created_at<? LIMIT 1", (bounds[1],)).fetchone()
-        publication = ('受阻，失败原因：存在旧提交结果待核实（' + held['title'] + '）' if held else
-                       ('受阻，失败原因：' + '；'.join(dict.fromkeys(blocked)) if blocked else '未执行'))
-        if held:
-            failures['发布任务'] = '旧提交结果待核实，已保留防重发保护：' + held['title']
+        publication = '受阻，失败原因：' + '；'.join(dict.fromkeys(blocked)) if blocked else '未执行'
     elif any(r['status'] in ('FAILED', 'ABORTED', 'PARTIAL_FAILURE') for r in publish_runs):
         publication = '失败，失败原因：' + (next(iter(failures.values()), '') or '未完成发布，详见任务记录')
     else:
@@ -148,6 +144,10 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
     lines.extend(f'- {clean(label)}，失败原因：{clean(reason)}' for label, reason in failures.items())
     if not failures:
         lines.append('- 无')
+    pending = db.execute("SELECT title FROM submission_attempts WHERE status='UNKNOWN' AND created_at<? ORDER BY id", (bounds[1],)).fetchall()
+    if pending:
+        lines.append('待核实歌曲（仅跳过该歌曲，不影响后续日期的任务）：')
+        lines.extend('- ' + clean(row['title']) for row in pending)
     return '\n'.join(lines)
 
 
