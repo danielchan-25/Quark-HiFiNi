@@ -44,7 +44,7 @@ class MySQLTests(unittest.TestCase):
     def setUpClass(cls):
         raw=json.loads(Path(os.environ['HIFINI_MYSQL_CONFIG']).read_text()) if os.getenv('HIFINI_MYSQL_CONFIG') else {
             'host':os.getenv('MYSQL_TEST_HOST','127.0.0.1'),'user':'root','password':os.getenv('MYSQL_TEST_PASSWORD','ci-test-only'),'database':'quark_hifini_ci'}
-        cls.cfg=replace(mysql.Config(**raw),prefix='bilibili_HiFiNi_it_'+uuid.uuid4().hex[:4])
+        cls.cfg=replace(mysql.Config(**raw),prefix='hifini_it_'+uuid.uuid4().hex[:4])
         memory=app.Store(':memory:');cls.schema=mysql.create_schema(cls.cfg,memory.db);mysql.import_rows(cls.cfg,memory.db,cls.schema);memory.close()
         cls.directory=tempfile.TemporaryDirectory(prefix='quark-hifini-mysql-integration-');cls.root=Path(cls.directory.name)
         (cls.root/'main.py').touch()

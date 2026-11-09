@@ -137,9 +137,9 @@ journalctl --user -u quark-hifini-monitor.service --since today
 
 ### MySQL 存储
 
-部署可通过 `STORAGE_BACKEND=mysql` 使用 MySQL 8。当前部署的数据库为 `Quark`，歌曲主表为 `bilibili_HiFiNi`；运行、事件、草稿、上传、AI 审核、历史迁移等表均以 `bilibili_HiFiNi_` 开头，不访问同库其他项目的表。
+部署可通过 `STORAGE_BACKEND=mysql` 使用 MySQL 8。当前部署的数据库为 `Quark`，歌曲主表为 `hifini`；运行、事件、草稿、上传、AI 审核、历史迁移等表均以 `hifini_` 开头，不访问同库其他项目的表。
 
-`bilibili_HiFiNi_state` 保存汇总发送回执、工作流、预检、监测与备份状态及导入的原始文件；`bilibili_HiFiNi_logs` 保存新增日志。MySQL 模式不再写本地 SQLite、状态 JSON、应用日志或文件锁，采用数据库事务和命名锁；数据库不可用时停止任务，不回退空库或本地状态。预览使用内存数据库隔离业务变更，第三方 CLI 的临时输出放在 `/tmp` 并自动清理。程序、连接凭据、浏览器和网盘设备授权仍由本机管理，`upload-files/` 是用户提供新文件的输入目录。
+`hifini_state` 保存汇总发送回执、工作流、预检、监测与备份状态及导入的原始文件；`hifini_logs` 保存新增日志。MySQL 模式不再写本地 SQLite、状态 JSON、应用日志或文件锁，采用数据库事务和命名锁；数据库不可用时停止任务，不回退空库或本地状态。预览使用内存数据库隔离业务变更，第三方 CLI 的临时输出放在 `/tmp` 并自动清理。程序、连接凭据、浏览器和网盘设备授权仍由本机管理，`upload-files/` 是用户提供新文件的输入目录。
 
 先备份、停止本项目任务、用 `migrate_mysql.py` 导入并逐行校验，再启用 MySQL 配置；不能仅改连接地址后从空库运行。迁移保持原主键、提交日期、防重发状态、历史原始 JSON 和通知回执，导入文件按字节校验。迁移工具默认只预览，`--execute` 才导入，不会替你切换生产。
 
