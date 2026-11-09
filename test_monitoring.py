@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import main as app
 import monitoring as monitor
+import preflight
 
 
 class MonitorTests(unittest.TestCase):
@@ -72,6 +73,35 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(monitor.outcome('daily', 1, facts), 'FAILED')
         facts['attempts'].append({'status': 'UNKNOWN'})
         self.assertEqual(monitor.outcome('daily', 1, facts), 'UNKNOWN')
+
+    def test_recovered_preflight_resolves_alert_without_changing_old_failure(self):
+        row = self.add_record(outcome='FAILED', exit_code=1,
+                              workflow={'publication': 'blocked_by_preflight', 'ended_at': '2026-10-30T06:00:01+08:00',
+                                        'preflight': {'blockers': [{'code': 'dependency:node', 'detail': '缺少运行程序：node'}]}})
+        self.assertEqual(self.check(), 1)
+        report = {'blockers': []}
+        with patch.object(preflight, 'datetime') as clock:
+            clock.now.return_value = self.at - timedelta(minutes=1)
+            preflight.persist(self.root, report, 0, 'healthy-proof')
+        self.assertEqual(self.check(), 0)
+        state = monitor.read(monitor.monitor_dir(self.root) / 'last-check.json')
+        self.assertFalse(state['problems'])
+        self.assertFalse(state['warnings'])
+        self.assertEqual(state['status'], 'OK')
+        self.assertEqual(state['recoveries'][0]['kind'], 'recovered_preflight')
+        incident = monitor.read(monitor.monitor_dir(self.root) / 'incidents.json')['2026-10-30:daily:failed']
+        self.assertTrue(incident['resolved_at'])
+        self.assertTrue(incident['resolution_evidence']['recovered'])
+        original = monitor.read(monitor.monitor_dir(self.root) / 'runs/daily/2026-10-30/example.json')
+        self.assertEqual(original, row)
+
+    def test_environment_success_never_hides_publish_failure(self):
+        self.add_record(outcome='FAILED', exit_code=1, workflow={'publication': 'finished_check_database_for_actual_submission_result'})
+        report = {'blockers': []}
+        with patch.object(preflight, 'datetime') as clock:
+            clock.now.return_value = self.at - timedelta(minutes=1)
+            preflight.persist(self.root, report, 0, 'healthy-proof')
+        self.assertEqual(self.check(), 1)
 
     def test_stopped_owner_and_long_running_owner(self):
         self.add_record(state='RUNNING')

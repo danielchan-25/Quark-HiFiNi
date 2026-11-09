@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 from ai_review import ReviewConfig, ShadowReviewer
 import notifications
+import preflight
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1448,7 +1449,7 @@ def test_feishu() -> int:
         finally: store.close()
 
 
-def check_local() -> int:
+def check_local(workflow_id: str | None = None) -> int:
     """Local-only migration and health report; never logs in or sends notifications."""
     with RunLock():
         settings = Settings.load(); store = Store()
@@ -1479,8 +1480,14 @@ def check_local() -> int:
                 "unresolved_blocks_other_songs": False,
                 "pending_alerts": store.db.execute("SELECT COUNT(*) FROM alerts WHERE status IN ('FAILED','UNKNOWN','NOT_CONFIGURED')").fetchone()[0],
             }
+            report['blockers'] = preflight.blockers(report)
+            code = 1 if report['blockers'] else 0
+            try:
+                preflight.persist(ROOT, report, code, workflow_id)
+            except (OSError, ValueError) as exc:
+                print(json.dumps({'event': 'preflight_record_unavailable', 'error_type': type(exc).__name__}), file=sys.stderr)
             print(json.dumps(report, ensure_ascii=True, indent=2))
-            return 0 if integrity == "ok" and all(report["dependencies"].values()) and report["git_bash"] and report["quark_cli"] else 1
+            return code
         finally: store.close()
 
 
@@ -1574,7 +1581,8 @@ def cli(argv: list[str] | None = None) -> int:
     upload.add_argument("--slot-date", help="authorized task date YYYY-MM-DD; prevents duplicate slot execution")
     sub.add_parser("test-feishu", help="send one Feishu configuration test")
     sub.add_parser('test-ai', help='test the configured AI with one real request; no upload or publication')
-    sub.add_parser("check", help="local health check and import legacy logs; no network calls")
+    health = sub.add_parser("check", help="local health check and import legacy logs; no network calls")
+    health.add_argument('--workflow-id', help=argparse.SUPPRESS)
     retry = sub.add_parser('retry-alert', help='explicitly retry one proven unsent notification; never UNKNOWN')
     retry.add_argument('alert_id', type=int)
     report = sub.add_parser("daily-summary", help="preview combined daily summary; --send sends once per date")
@@ -1592,7 +1600,7 @@ def cli(argv: list[str] | None = None) -> int:
         if ns.command == "run":
             if ns.dry_run and ns.publish: parser.error("--dry-run and --publish cannot be used together")
             return run(ns)
-        if ns.command == "check": return check_local()
+        if ns.command == "check": return check_local(ns.workflow_id)
         if ns.command == 'test-ai': return test_ai()
         if ns.command == 'retry-alert': return retry_alert(ns.alert_id)
         if ns.command == "daily-summary":
@@ -1604,6 +1612,11 @@ def cli(argv: list[str] | None = None) -> int:
         if ns.command == "resolve-submission": return resolve_submission(ns.attempt_id, ns.url, ns.submitted)
         return test_feishu()
     except (OSError, sqlite3.Error, FlowError) as exc:
+        if ns.command == 'check':
+            try:
+                preflight.persist(ROOT, {'blockers': [{'code': 'check_error', 'detail': redact(str(exc))}]}, 1, ns.workflow_id)
+            except (OSError, ValueError):
+                pass
         print(f"操作失败：{redact(str(exc))}", file=sys.stderr, flush=True)
         return 1
     except KeyboardInterrupt:

@@ -12,6 +12,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import preflight
 
 
 def finish(result: dict, workflow_id: str) -> None:
@@ -81,7 +83,8 @@ def main() -> int:
         run = ['bash', str(ROOT / 'scripts' / 'run.sh')]
         tracking = ['--session-input', session_input, '--session-id', session_id]
         result = {'date': day, 'upload_exit': stage('upload', run + ['upload', '--apply', '--slot-date', day] + tracking)}
-        result['check_exit'] = stage('preflight', run + ['check'])
+        result['check_exit'] = stage('preflight', run + ['check', '--workflow-id', workflow_id])
+        result['preflight'] = preflight.workflow_result(ROOT, workflow_id, result['check_exit'])
         if result['check_exit']:
             result['publication'] = 'blocked_by_preflight'
         else:

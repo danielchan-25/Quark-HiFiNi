@@ -22,6 +22,7 @@ import uuid
 from dotenv import load_dotenv
 import main as app
 import notifications
+import preflight
 
 ROOT = Path(__file__).resolve().parent
 BEIJING = timezone(timedelta(hours=8))
@@ -344,7 +345,14 @@ def inspect(root: Path, at: datetime, config: dict, services: dict) -> tuple[lis
                 elif elapsed > maximum:
                     problem(f'{day}:{task}:slow', f'{task} 运行超过 {maximum // 60} 分钟', record=row)
             elif row['outcome'] in ('FAILED', 'UNKNOWN'):
-                problem(f'{day}:{task}:failed', f'{task} 执行异常：{row["outcome"]}，退出码 {row["exit_code"]}', record=row)
+                assessment = preflight.assess(root, row, at) if task == 'daily' else None
+                key = f'{day}:{task}:failed'
+                if assessment and assessment['recovered']:
+                    warnings.append({'key': key, 'task': task, 'date': str(day), 'kind': 'recovered_preflight',
+                                     'detail': preflight.describe(assessment), 'recovery': assessment, 'record': row})
+                else:
+                    detail = preflight.describe(assessment) if assessment else f'{task} 执行异常：{row["outcome"]}，退出码 {row["exit_code"]}'
+                    problem(key, detail, record=row)
             elif row['outcome'] == 'PARTIAL_FAILURE':
                 warnings.append({'task': task, 'date': str(day), 'detail': '已有确认提交，部分候选处理失败', 'record': row})
     db = connection(root)
@@ -415,6 +423,9 @@ def check(root: Path, send: bool = False) -> int:
                 checked_dates = {str(at.date()), str(at.date() - timedelta(days=1))}
                 if complete and key.split(':', 1)[0] in checked_dates and key not in keys and not row.get('resolved_at'):
                     row['resolved_at'] = at.isoformat()
+                    recovery = next((item['recovery'] for item in warnings if item.get('key') == key and item.get('kind') == 'recovered_preflight'), None)
+                    if recovery:
+                        row['resolution_evidence'] = recovery
             for issue in problems:
                 key = issue['key']
                 if key not in history:
@@ -446,8 +457,10 @@ def check(root: Path, send: bool = False) -> int:
                     emit(log, 'monitor_notification', key=key, status=incident['notification'])
                 issue['notification'] = incident.get('notification', 'NOT_REQUESTED')
             save(directory / 'incidents.json', history)
+            recoveries = [item for item in warnings if item.get('kind') == 'recovered_preflight']
+            warnings = [item for item in warnings if item.get('kind') != 'recovered_preflight']
             report = {'checked_at': at.isoformat(), 'status': 'ERROR' if problems else ('WARNING' if warnings else 'OK'),
-                      'problems': problems, 'warnings': warnings, 'checks_complete': complete}
+                      'problems': problems, 'warnings': warnings, 'recoveries': recoveries, 'checks_complete': complete}
             save(directory / 'last-check.json', report)
             emit(log, 'monitor_checked', status=report['status'], problems=len(problems), warnings=len(warnings))
             prune(root, at)

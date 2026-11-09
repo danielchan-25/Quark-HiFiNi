@@ -287,6 +287,15 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(state['unresolved_submissions'], 1)
         self.assertFalse(state['unresolved_blocks_other_songs'])
 
+    def test_preflight_configuration_error_is_saved_with_redacted_cause(self):
+        with patch.dict(os.environ, {'HIFINI_PASSWORD': 'private-config-password'}), \
+                patch.object(app.Settings, 'load', side_effect=app.FlowError('配置错误 private-config-password')):
+            self.assertEqual(app.cli(['check', '--workflow-id', 'failed-config']), 1)
+        state = json.loads((self.root / 'data/preflight/runs/failed-config.json').read_text())
+        self.assertEqual(state['status'], 'FAIL')
+        self.assertIn('配置错误', state['blockers'][0]['detail'])
+        self.assertNotIn('private-config-password', state['blockers'][0]['detail'])
+
     def test_publish_flow_persists_one_confirmed_attempt(self):
         code, quark, hifini = self.workflow(True)
         self.assertEqual(code, 0)

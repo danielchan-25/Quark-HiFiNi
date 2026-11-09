@@ -57,14 +57,15 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('upload', calls[0])
         self.assertIn('--apply', calls[0])
         self.assertEqual(calls[0][calls[0].index('--session-input') + 1], instruction)
-        self.assertEqual(calls[1][-1], 'check')
+        self.assertEqual(calls[1][2], 'check')
+        self.assertIn('--workflow-id', calls[1])
         self.assertEqual(len(calls), 2)
 
     def test_publish_occurs_once_after_check_and_browser(self):
         code, calls, instruction = self.execute_workflow([0, 0, 0, 1])
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 4)
-        self.assertEqual(calls[1][-1], 'check')
+        self.assertEqual(calls[1][2], 'check')
         self.assertTrue(calls[2][-1].endswith('start-browser.sh'))
         self.assertIn('--publish', calls[3])
         self.assertEqual(calls[3][calls[3].index('--session-input') + 1], instruction)

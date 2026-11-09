@@ -9,6 +9,7 @@ import uuid
 
 import main as app
 import notifications
+import preflight
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -30,7 +31,12 @@ def workflow_records(root: Path, day: date) -> list[dict]:
         for path in sorted(base.glob('*.json')):
             try:
                 row = json.loads(path.read_text(encoding='utf-8'))
-                value = row.get('workflow', row)
+                value = dict(row.get('workflow', row))
+                value.setdefault('date', day.isoformat())
+                value.setdefault('workflow_id', row.get('id', path.stem))
+                assessment = preflight.assess(root, {**row, 'workflow': value})
+                if assessment:
+                    value['preflight_assessment'] = assessment
                 rows[row.get('workflow_id', row.get('id', path.stem))] = value
             except (OSError, ValueError, AttributeError):
                 rows[str(path)] = {'publication': 'record_unavailable'}
@@ -59,9 +65,16 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
                  for r in attempts if r['status'] == 'CONFIRMED'}
     failures: dict[str, str] = {}
     blocked = []
+    preflight_recovered = []
     for workflow in workflows or []:
+        assessment = workflow.get('preflight_assessment')
+        if assessment and assessment.get('recovered'):
+            preflight_recovered.append(preflight.describe(assessment))
+            continue
         reason = {'blocked_by_preflight': '本地预检未通过', 'blocked_by_browser': '浏览器启动失败',
                   'record_unavailable': '工作流记录无法读取，需要核查日志'}.get(workflow.get('publication'))
+        if reason and assessment:
+            reason = preflight.describe(assessment)
         if reason:
             blocked.append(reason)
             failures['发布前置检查'] = reason
@@ -116,7 +129,8 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
     elif any(r['status'] == 'RUNNING' for r in publish_runs):
         publication = '进行中，尚无确认提交'
     elif not publish_runs:
-        publication = '受阻，失败原因：' + '；'.join(dict.fromkeys(blocked)) if blocked else '未执行'
+        publication = ('受阻，失败原因：' + '；'.join(dict.fromkeys(blocked)) if blocked else
+                       ('当日未发布；预检问题已恢复，等待下次计划（未补跑）' if preflight_recovered else '未执行'))
     elif any(r['status'] in ('FAILED', 'ABORTED', 'PARTIAL_FAILURE') for r in publish_runs):
         publication = '失败，失败原因：' + (next(iter(failures.values()), '') or '未完成发布，详见任务记录')
     else:
@@ -144,6 +158,9 @@ def build_summary(db: sqlite3.Connection, day: date, workflows: list[dict] | Non
     lines.extend(f'- {clean(label)}，失败原因：{clean(reason)}' for label, reason in failures.items())
     if not failures:
         lines.append('- 无')
+    if preflight_recovered:
+        lines.append('历史受阻及恢复：')
+        lines.extend('- ' + clean(item) for item in preflight_recovered)
     pending = db.execute("SELECT title FROM submission_attempts WHERE status='UNKNOWN' AND created_at<? ORDER BY id", (bounds[1],)).fetchall()
     if pending:
         lines.append('待核实歌曲（仅跳过该歌曲，不影响后续日期的任务）：')

@@ -91,6 +91,25 @@ class SummaryTests(unittest.TestCase):
             self.assertIn('发布前置检查', text)
             self.assertNotIn('失败任务：\n- 无', text)
 
+    def test_recovered_preflight_keeps_missed_publication_distinct_from_success(self):
+        assessment = {'occurred_at': '2026-10-15T06:00:01+08:00', 'reason': '缺少运行程序：node',
+                      'recovered': True, 'recovered_at': '2026-10-15T14:30:00+08:00'}
+        text = report.build_summary(self.db, self.day, [{'publication': 'blocked_by_preflight', 'preflight_assessment': assessment}])
+        self.assertIn('当日未发布；预检问题已恢复', text)
+        self.assertIn('2026-10-15 06:00:01', text)
+        self.assertIn('缺少运行程序：node', text)
+        self.assertIn('2026-10-15 14:30:00', text)
+        self.assertIn('未补跑', text)
+        self.assertNotIn('发布任务：成功', text)
+        self.assertNotIn('失败原因：本地预检未通过', text)
+
+    def test_active_preflight_lists_specific_reason_and_time(self):
+        assessment = {'occurred_at': '2026-10-15T06:00:01+08:00', 'reason': '缺少运行程序：node', 'recovered': False}
+        text = report.build_summary(self.db, self.day, [{'publication': 'blocked_by_preflight', 'preflight_assessment': assessment}])
+        self.assertIn('发布任务：受阻', text)
+        self.assertIn('2026-10-15 06:00:01', text)
+        self.assertIn('缺少运行程序：node', text)
+
     def test_upload_recovered_later_is_success_with_history(self):
         self.run_row('old', 'upload', 'PARTIAL_FAILURE')
         self.run_row('new', 'upload', started='2026-10-14 23:00:00')
