@@ -23,6 +23,21 @@ from scripts import daily_workflow
 from datetime import datetime
 
 
+class StorageConfigurationTests(unittest.TestCase):
+    def test_missing_configuration_cannot_recreate_a_retired_local_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'main.py').touch()
+            with self.assertRaises(sqlite3.OperationalError):mysql.config(root)
+            self.assertFalse((root/'data/quark-hifini.db').exists())
+            (root/'.env').write_text('STORAGE_BACKEND=sqlite\n')
+            self.assertIsNone(mysql.config(root))
+
+    def test_unknown_backend_never_falls_back_to_local_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'.env').write_text('STORAGE_BACKEND=mysqll\n')
+            with self.assertRaises(sqlite3.OperationalError):mysql.config(root)
+
+
 @unittest.skipUnless(os.getenv('HIFINI_MYSQL_INTEGRATION')=='1','MySQL integration is explicitly enabled')
 class MySQLTests(unittest.TestCase):
     @classmethod
@@ -114,6 +129,18 @@ class MySQLTests(unittest.TestCase):
             with self.assertRaises(BlockingIOError):
                 with mysql.lock(self.cfg,'test'):pass
         with mysql.lock(self.cfg,'test'):pass
+
+    def test_missing_migration_marker_never_starts_an_empty_database(self):
+        db=mysql.connect(self.cfg,autocommit=True)
+        try:
+            with db.cursor() as c:
+                c.execute('SELECT content,sha256 FROM `'+self.cfg.table('state')+'` WHERE path=%s',('metadata/schema',));saved=c.fetchone()
+                c.execute('DELETE FROM `'+self.cfg.table('state')+'` WHERE path=%s',('metadata/schema',))
+            with self.assertRaises(sqlite3.OperationalError):app.Store()
+            self.assertFalse((self.root/'data/quark-hifini.db').exists())
+        finally:
+            with db.cursor() as c:c.execute('INSERT INTO `'+self.cfg.table('state')+'` (path,content,sha256) VALUES(%s,%s,%s)',('metadata/schema',*saved))
+            db.close()
 
     def test_full_monitor_wrapper_records_child_without_local_runtime_files(self):
         code="""import sys,uuid

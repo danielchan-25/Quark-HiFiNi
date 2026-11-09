@@ -28,8 +28,13 @@ class Config:
 
 def config(root: Path) -> Config | None:
     values = dotenv_values(root / '.env')
-    if values.get('STORAGE_BACKEND', 'sqlite').lower() != 'mysql':
+    backend=values.get('STORAGE_BACKEND')
+    if backend is None:
+        if (root/'main.py').is_file() and not (root/'data/quark-hifini.db').is_file():
+            raise sqlite3.OperationalError('未配置存储且未找到原数据库，禁止自动创建本地空库')
         return None
+    if backend.strip().lower()=='sqlite':return None
+    if backend.strip().lower()!='mysql':raise sqlite3.OperationalError('STORAGE_BACKEND 只能为 mysql 或 sqlite，禁止静默回退')
     cfg = Config(values.get('MYSQL_HOST', ''), values.get('MYSQL_USER', ''), values.get('MYSQL_PASSWORD', ''),
                  int(values.get('MYSQL_PORT', '3306')), values.get('MYSQL_DATABASE', 'Quark'),
                  values.get('MYSQL_TABLE_PREFIX', 'bilibili_HiFiNi'))
