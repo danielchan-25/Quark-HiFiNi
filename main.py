@@ -34,6 +34,8 @@ from dotenv import load_dotenv
 from ai_review import ReviewConfig, ShadowReviewer
 import notifications
 import preflight
+import mysql_storage
+import runtime_store as runtime
 
 
 ROOT = Path(__file__).resolve().parent
@@ -60,6 +62,13 @@ def curl_binary() -> str:
 class RunLock:
     """OS-owned lock: a crash releases ownership without deleting stale files."""
     def __enter__(self) -> "RunLock":
+        self.remote = None
+        cfg = mysql_storage.config(ROOT)
+        if cfg:
+            self.remote = mysql_storage.lock(cfg, 'business')
+            try: self.remote.__enter__()
+            except BlockingIOError: raise FlowError('已有任务正在运行，请等待其结束') from None
+            return self
         path = ROOT / "data" / "run.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
         self.file = path.open("a+b")
@@ -80,6 +89,9 @@ class RunLock:
         return self
 
     def __exit__(self, *args: Any) -> None:
+        if self.remote is not None:
+            self.remote.__exit__(*args)
+            return
         self.file.seek(0)
         if os.name == "nt":
             import msvcrt
@@ -121,7 +133,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        for key in ("HIFINI_PASSWORD", "FEISHU_SECRET", "FEISHU_WEBHOOK", "TYPESAFE_API_KEY", "AI_API_KEY"):
+        for key in ("HIFINI_PASSWORD", "FEISHU_SECRET", "FEISHU_WEBHOOK", "TYPESAFE_API_KEY", "AI_API_KEY", "MYSQL_PASSWORD"):
             secret = os.getenv(key)
             if secret:
                 value = value.replace(secret, "[REDACTED]")
@@ -203,6 +215,12 @@ class JsonLogger:
 
 class Store:
     def __init__(self, path: Path | str | None = None) -> None:
+        if path is None and (cfg := mysql_storage.config(ROOT)):
+            self.db = mysql_storage.Connection(cfg)
+            if self.db.schema['version'] != SCHEMA_VERSION:
+                self.db.close()
+                raise FlowError('MySQL 数据结构版本不匹配，请先执行迁移，禁止从空库或旧版本运行')
+            return
         path = path or ROOT / "data" / "quark-hifini.db"
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +324,7 @@ class Store:
         self.db.close()
 
     def import_logs(self) -> int:
+        if isinstance(self.db, mysql_storage.Connection): return 0
         count = 0
         for path in sorted((ROOT / "logs").glob("*.jsonl")):
             with path.open(encoding="utf-8-sig") as source:
@@ -404,7 +423,7 @@ class Store:
         return int(self.db.execute("""SELECT COUNT(*) FROM (
             SELECT id FROM resources WHERE submitted_at>=? AND submitted_at<?
             UNION SELECT resource_id FROM submission_attempts WHERE status IN ('UNKNOWN','SUBMITTING','CONFIRMED')
-            AND created_at>=? AND created_at<?)""", (start, end, start, end)).fetchone()[0])
+            AND created_at>=? AND created_at<?) AS submitted_resources""", (start, end, start, end)).fetchone()[0])
 
     def begin_submission(self, run_id: str, resource_id: int, title: str) -> int:
         with self.db:
@@ -556,7 +575,12 @@ class Quark:
         if self.session_input and self.session_id:
             tracked_arguments.extend(["--session-input", self.session_input, "--session-id", self.session_id])
         self.log.event("INFO", "quark_command_started", command=arguments[0])
-        result = execute(["node", str(cli), *tracked_arguments], cwd=ROOT, timeout=timeout, operation=f"夸克 {arguments[0]}", env=direct_env)
+        workdir = ROOT
+        if mysql_storage.config(ROOT):
+            if not hasattr(self, '_artifacts'):
+                self._artifacts = tempfile.TemporaryDirectory(prefix='quark-hifini-api-')
+            workdir = Path(self._artifacts.name)
+        result = execute(["node", str(cli), *tracked_arguments], cwd=workdir, timeout=timeout, operation=f"夸克 {arguments[0]}", env=direct_env)
         try:
             rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
             results = [row for row in rows if isinstance(row, dict) and row.get("type") == "result"]
@@ -1458,6 +1482,8 @@ def check_local(workflow_id: str | None = None) -> int:
             recovered = store.recover_interrupted()
             integrity = store.db.execute("PRAGMA quick_check").fetchone()[0]
             report = {
+                "storage_backend": 'mysql' if isinstance(store.db, mysql_storage.Connection) else 'sqlite',
+                "database_namespace": (store.db.cfg.database + '.' + store.db.cfg.prefix) if isinstance(store.db, mysql_storage.Connection) else str(ROOT / 'data/quark-hifini.db'),
                 "database": integrity, "imported_logs": imported, "recovered_runs": recovered,
                 "dependencies": {name: bool(shutil.which(name)) for name in ("node", curl_binary())},
                 "ffprobe": ffprobe_path(),
@@ -1583,6 +1609,10 @@ def cli(argv: list[str] | None = None) -> int:
     sub.add_parser('test-ai', help='test the configured AI with one real request; no upload or publication')
     health = sub.add_parser("check", help="local health check and import legacy logs; no network calls")
     health.add_argument('--workflow-id', help=argparse.SUPPRESS)
+    logs = sub.add_parser('logs', help='read task logs from the configured storage')
+    logs.add_argument('--task',choices=['daily','summary'],default='daily')
+    logs.add_argument('--date',default=datetime.now(BEIJING).date().isoformat())
+    logs.add_argument('--lines',type=int,default=100)
     retry = sub.add_parser('retry-alert', help='explicitly retry one proven unsent notification; never UNKNOWN')
     retry.add_argument('alert_id', type=int)
     report = sub.add_parser("daily-summary", help="preview combined daily summary; --send sends once per date")
@@ -1601,6 +1631,15 @@ def cli(argv: list[str] | None = None) -> int:
             if ns.dry_run and ns.publish: parser.error("--dry-run and --publish cannot be used together")
             return run(ns)
         if ns.command == "check": return check_local(ns.workflow_id)
+        if ns.command == 'logs':
+            from datetime import date
+            try: day=date.fromisoformat(ns.date).isoformat()
+            except ValueError: raise FlowError('日期须为 YYYY-MM-DD') from None
+            if not 1<=ns.lines<=10000:raise FlowError('日志行数须在 1 到 10000 之间')
+            lines=[]
+            for path in runtime.paths(ROOT/'logs/monitor'/ns.task/day,'*.log'):lines.extend(runtime.text(path).splitlines())
+            print('\n'.join(lines[-ns.lines:]))
+            return 0
         if ns.command == 'test-ai': return test_ai()
         if ns.command == 'retry-alert': return retry_alert(ns.alert_id)
         if ns.command == "daily-summary":

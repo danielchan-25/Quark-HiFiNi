@@ -14,6 +14,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import preflight
+import runtime_store as runtime
 
 
 def finish(result: dict, workflow_id: str) -> None:
@@ -22,6 +23,9 @@ def finish(result: dict, workflow_id: str) -> None:
     print(json.dumps(result), flush=True)
     path = ROOT / 'data' / 'workflows' / result['date'] / (workflow_id + '.json')
     try:
+        if runtime.enabled(ROOT):
+            runtime.write_json(path,result)
+            return
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = path.with_suffix('.tmp')
         with temporary.open('w', encoding='utf-8') as stream:
@@ -73,12 +77,13 @@ def main() -> int:
     if not session_input.strip():
         parser.error('The task instruction file is empty')
     (ROOT / 'data').mkdir(parents=True, exist_ok=True)
-    with (ROOT / 'data' / 'daily-workflow.lock').open('a+') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            finish({'date': day, 'status': 'already_running', 'publication': 'busy'}, workflow_id)
-            return 0
+    try:
+        lock_context = runtime.lock(ROOT, 'workflow', ROOT / 'data/daily-workflow.lock')
+        lock_context.__enter__()
+    except BlockingIOError:
+        finish({'date': day, 'status': 'already_running', 'publication': 'busy'}, workflow_id)
+        return 0
+    try:
         session_id = f'{int(time.time())}-{secrets.token_hex(3)}'
         run = ['bash', str(ROOT / 'scripts' / 'run.sh')]
         tracking = ['--session-input', session_input, '--session-id', session_id]
@@ -97,6 +102,8 @@ def main() -> int:
                 result['publication'] = 'finished_check_database_for_actual_submission_result'
         finish(result, workflow_id)
         return int(any(result.get(key, 0) != 0 for key in ('upload_exit', 'check_exit', 'browser_exit', 'publish_exit')))
+    finally:
+        lock_context.__exit__(None,None,None)
 
 
 if __name__ == '__main__':

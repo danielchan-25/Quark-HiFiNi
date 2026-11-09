@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+import mysql_storage
 
 ROOT = Path(__file__).resolve().parent
 BEIJING = timezone(timedelta(hours=8))
@@ -66,6 +67,9 @@ def verify(archive: Path, manifest: dict, tables: dict | None = None) -> None:
 
 
 def perform(root: Path, destination: Path, records: Path, retention_days: int = 14) -> dict:
+    if mysql_storage.config(root):
+        import mysql_backup
+        return mysql_backup.perform(root,destination,records,retention_days)
     directory = root / 'data' / 'backup'
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / 'job.lock').open('a+b') as lock:
@@ -184,7 +188,7 @@ def main() -> int:
     parser.add_argument('--retention-days', type=int, default=14)
     args = parser.parse_args()
     if not args.execute:
-        print('Preview: consistent SQLite/state backup, checksums and isolated restore verification; no changes.')
+        print('Preview: consistent database/state backup, checksums and isolated restore verification; no changes.')
         return 0
     try:
         print(json.dumps(perform(ROOT, args.destination, args.record_dir, args.retention_days), ensure_ascii=False))

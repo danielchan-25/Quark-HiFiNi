@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 import main as app
 import notifications
 import preflight
+import runtime_store as runtime
+import mysql_storage
 
 ROOT = Path(__file__).resolve().parent
 BEIJING = timezone(timedelta(hours=8))
@@ -47,6 +49,9 @@ def clean(value):
 
 
 def save(path: Path, value) -> None:
+    if runtime.project(path)[1]:
+        runtime.write_json(path,clean(value))
+        return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
@@ -61,7 +66,7 @@ def save(path: Path, value) -> None:
 
 
 def read(path: Path, default=None):
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else default
+    return runtime.read_json(path,default)
 
 
 def monitor_dir(root: Path) -> Path:
@@ -69,6 +74,20 @@ def monitor_dir(root: Path) -> Path:
 
 
 def logger(path: Path) -> logging.Logger:
+    root,cfg=runtime.project(path)
+    if cfg:
+        class DatabaseHandler(logging.Handler):
+            def __init__(self):
+                super().__init__();self.db=mysql_storage.connect(cfg,autocommit=True)
+            def emit(self, record):
+                try:runtime.append_log(path,clean(self.format(record)),self.db)
+                except Exception as exc:raise OSError('MySQL 日志写入失败：'+str(clean(str(exc)))) from None
+            def close(self):
+                try:
+                    if self.db.open:self.db.close()
+                finally:super().close()
+        result=logging.Logger(str(path));result.addHandler(DatabaseHandler())
+        return result
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     result = logging.Logger(str(path))
     class FileHandler(RotatingFileHandler):
@@ -109,6 +128,7 @@ def persist_run(path: Path, record: dict) -> None:
 
 
 def connection(root: Path):
+    if cfg := mysql_storage.config(root): return mysql_storage.Connection(cfg,readonly=True)
     db = sqlite3.connect((root / 'data' / 'quark-hifini.db').resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA query_only=ON')
@@ -145,7 +165,7 @@ def evidence(root: Path, previous: set[str], task: str, day: str) -> dict:
         if task == 'summary':
             directory = root / 'data' / 'daily-summaries'
             receipt = directory / (day + '.retry.json')
-            if not receipt.exists():
+            if not runtime.exists(receipt):
                 receipt = directory / (day + '.json')
             result['receipt_status'] = (read(receipt) or {}).get('status', 'MISSING')
         return clean(result)
@@ -182,15 +202,15 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
     storage_error = None
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock = (directory / (task + '.lock')).open('a+')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock = runtime.lock(root,'monitor.'+task,directory/(task+'.lock'))
+        lock.__enter__()
     except BlockingIOError:
-        lock.close()
+        if lock: lock = None
         print(json.dumps({'status': 'already_running', 'task': task}))
         return 0
     except OSError as exc:
         storage_error = clean(str(exc))
-        if lock: lock.close()
+        if lock: lock.__exit__(None,None,None)
         lock = None
     path = directory / 'runs' / task / day / (identifier + '.json')
     log_path = root / 'logs' / 'monitor' / task / day / (identifier + '.log')
@@ -293,7 +313,7 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
              duration_seconds=record['duration_seconds'], record_path=str(path))
         for handler in log.handlers:
             handler.close()
-        if lock: lock.close()
+        if lock: lock.__exit__(None,None,None)
     return code
 
 
@@ -329,7 +349,7 @@ def inspect(root: Path, at: datetime, config: dict, services: dict) -> tuple[lis
             due = datetime.combine(day, datetime.min.time(), BEIJING).replace(hour=hour, minute=minute)
             if due < enabled or at < due:
                 continue
-            records = [read(path) for path in sorted((monitor_dir(root) / 'runs' / task / day.isoformat()).glob('*.json'))]
+            records = [read(path) for path in runtime.paths(monitor_dir(root) / 'runs' / task / day.isoformat(),'*.json')]
             records = [row for row in records if datetime.fromisoformat(row['started_at']) >= due]
             if not records:
                 if at >= due + GRACE:
@@ -390,6 +410,9 @@ def notify(detail: str) -> dict:
 
 
 def prune(root: Path, at: datetime) -> None:
+    if runtime.enabled(root):
+        runtime.prune(root,at)
+        return
     for base, days, pattern in [(root / 'logs' / 'monitor', 30, '*.log*'),
                                 (monitor_dir(root) / 'runs', 90, '*.json')]:
         for path in base.rglob(pattern):
@@ -402,11 +425,11 @@ def check(root: Path, send: bool = False) -> int:
     config = read(directory / 'config.json')
     if not config:
         raise ValueError('Run monitor.sh init before enabling the watchdog')
-    with (directory / 'check.lock').open('a+') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
+    try:
+        check_lock=runtime.lock(root,'monitor.check',directory/'check.lock')
+        check_lock.__enter__()
+    except BlockingIOError:return 0
+    try:
         at = now()
         log = logger(root / 'logs' / 'monitor' / 'watchdog.log')
         try:
@@ -468,6 +491,7 @@ def check(root: Path, send: bool = False) -> int:
         finally:
             for handler in log.handlers:
                 handler.close()
+    finally:check_lock.__exit__(None,None,None)
 
 
 def main() -> int:
@@ -485,7 +509,7 @@ def main() -> int:
     directory = monitor_dir(ROOT)
     if args.command == 'init':
         path = directory / 'config.json'
-        if not path.exists():
+        if not runtime.exists(path):
             save(path, {'enabled_at': now().isoformat(), 'log_retention_days': 30, 'record_retention_days': 90})
         print(json.dumps(read(path), ensure_ascii=False))
         return 0
@@ -496,7 +520,7 @@ def main() -> int:
         return run_task(ROOT, args.task)
     if args.command == 'check':
         return check(ROOT, args.notify)
-    rows = [read(path) for path in sorted((directory / 'runs').glob('*/*/*.json'))]
+    rows = [read(path) for path in runtime.paths(directory / 'runs','*/*/*.json')]
     print(json.dumps({'config': read(directory / 'config.json'), 'last_check': read(directory / 'last-check.json'),
                       'recent_runs': sorted(rows, key=lambda row: row['started_at'])[-10:]}, ensure_ascii=False, indent=2))
     return 0

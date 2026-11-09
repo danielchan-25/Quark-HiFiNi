@@ -10,6 +10,8 @@ import uuid
 import main as app
 import notifications
 import preflight
+import runtime_store as runtime
+import mysql_storage
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -28,9 +30,9 @@ def workflow_records(root: Path, day: date) -> list[dict]:
     rows = {}
     for base in (root / 'data' / 'monitor' / 'runs' / 'daily' / day.isoformat(),
                  root / 'data' / 'workflows' / day.isoformat()):
-        for path in sorted(base.glob('*.json')):
+        for path in runtime.paths(base,'*.json'):
             try:
-                row = json.loads(path.read_text(encoding='utf-8'))
+                row = runtime.read_json(path)
                 value = dict(row.get('workflow', row))
                 value.setdefault('date', day.isoformat())
                 value.setdefault('workflow_id', row.get('id', path.stem))
@@ -177,7 +179,8 @@ def run_summary(args) -> int:
         raise app.FlowError('不能汇总未来日期')
     with app.RunLock():
         path = app.ROOT / 'data' / 'quark-hifini.db'
-        db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+        cfg = mysql_storage.config(app.ROOT)
+        db = mysql_storage.Connection(cfg,readonly=True) if cfg else sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
         db.row_factory = sqlite3.Row
         try:
             db.execute('BEGIN')
@@ -191,21 +194,21 @@ def run_summary(args) -> int:
         directory.mkdir(parents=True, exist_ok=True)
         receipt = directory / (day.isoformat() + '.json')
         retried_receipt = directory / (day.isoformat() + '.retry.json')
-        if retried_receipt.exists():
-            retried = json.loads(retried_receipt.read_text(encoding='utf-8'))
+        if runtime.exists(retried_receipt):
+            retried = runtime.read_json(retried_receipt)
             print(json.dumps({'status': 'already_sent' if retried.get('status') == 'SENT' else 'needs_review',
                               'date': day.isoformat(), 'receipt_status': retried.get('status')}))
             return 0 if retried.get('status') == 'SENT' else 1
         if getattr(args, 'retry_undelivered', False):
-            if not args.send or not receipt.exists():
+            if not args.send or not runtime.exists(receipt):
                 raise app.FlowError('补发仅用于有既存回执的日期')
-            previous = json.loads(receipt.read_text(encoding='utf-8'))
+            previous = runtime.read_json(receipt)
             if previous.get('status') == 'SENT':
                 print(json.dumps({'status': 'already_sent', 'date': day.isoformat()}))
                 return 0
             # A DNS/bind/connect failure proves the webhook request was not sent.
             # Read timeouts, lost responses and interrupted attempts remain blocked.
-            connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+            connection = mysql_storage.Connection(cfg,readonly=True) if cfg else sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
             try:
                 connection.row_factory = sqlite3.Row
                 evidence = connection.execute("SELECT * FROM alerts WHERE run_id=? AND title='每日总结' ORDER BY id DESC LIMIT 1", (previous.get('run_id'),)).fetchone()
@@ -217,10 +220,9 @@ def run_summary(args) -> int:
         # Exclusive creation survives process interruption; uncertain delivery never retries.
         record = {'date': day.isoformat(), 'status': 'SENDING', 'message': message}
         try:
-            with receipt.open('x', encoding='utf-8') as stream:
-                json.dump(record, stream, ensure_ascii=False, indent=2)
+            runtime.write_json(receipt,record,exclusive=True)
         except FileExistsError:
-            previous = json.loads(receipt.read_text(encoding='utf-8'))
+            previous = runtime.read_json(receipt)
             print(json.dumps({'status': 'already_sent' if previous['status'] == 'SENT' else 'needs_review',
                               'date': day.isoformat(), 'receipt_status': previous['status']}))
             return 0 if previous['status'] == 'SENT' else 1
@@ -233,9 +235,11 @@ def run_summary(args) -> int:
             sent = notifier.alert('每日总结', message, raw_text=True, max_attempts=1)
             record.update(status='SENT' if sent else 'UNCONFIRMED', run_id=run_id)
             if isinstance(notifier.last_delivery, dict): record['delivery'] = app.redact(notifier.last_delivery)
-            temp = receipt.with_suffix('.tmp')
-            temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
-            temp.replace(receipt)
+            if cfg: runtime.write_json(receipt,record)
+            else:
+                temp = receipt.with_suffix('.tmp')
+                temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
+                temp.replace(receipt)
             store.finish_run(run_id, 'SUCCESS' if sent else 'FAILED', record['status'])
             print(json.dumps({'status': record['status'], 'date': day.isoformat()}))
             return 0 if sent else 1

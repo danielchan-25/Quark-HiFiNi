@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import uuid
+import runtime_store as runtime
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -34,7 +35,7 @@ def blockers(report: dict) -> list[dict]:
 
 def read(path: Path) -> dict | None:
     try:
-        value = json.loads(path.read_text(encoding='utf-8'))
+        value = runtime.read_json(path)
         return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
@@ -47,6 +48,9 @@ def persist(root: Path, report: dict, code: int, workflow_id: str | None = None)
     report.update(checked_at=datetime.now(BEIJING).isoformat(), exit_code=code,
                   status='PASS' if code == 0 else 'FAIL', workflow_id=workflow_id)
     for path in (root / 'data/preflight/runs' / (workflow_id + '.json'), root / 'data/preflight/latest.json'):
+        if runtime.enabled(root):
+            runtime.write_json(path,report)
+            continue
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
         try:
@@ -77,9 +81,8 @@ def legacy_report(root: Path, day: str, workflow_id: str) -> dict | None:
         return None
     path = root / 'logs/monitor/daily' / day / (workflow_id + '.log')
     try:
-        if path.stat().st_size > 11 * 1024 * 1024:
-            return None
-        text = path.read_text(encoding='utf-8')
+        if not runtime.enabled(root) and path.stat().st_size > 11 * 1024 * 1024: return None
+        text = runtime.text(path)
     except OSError:
         return None
     text = re.sub(r'(?m)^\d{4}-\d{2}-\d{2}T\S+ ', '', text)

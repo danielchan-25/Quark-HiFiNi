@@ -1,4 +1,4 @@
-name: Ubuntu offline checks
+name: Ubuntu and MySQL checks
 
 on:
   push:
@@ -10,6 +10,23 @@ permissions:
 jobs:
   offline-tests:
     runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-test-only
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: quark_hifini_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      HIFINI_MYSQL_INTEGRATION: '1'
+      MYSQL_TEST_PASSWORD: ci-test-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +37,7 @@ jobs:
         run: find scripts -name '*.sh' -print0 | xargs -0 -r -n 1 bash -n
       - name: Compile Python files
         run: python -m compileall -q .
-      - name: Run offline regression suite
+      - name: Run regression and MySQL integration suite
         run: python -m unittest discover -v
       - name: Check safe scheduling preview
         run: python scripts/daily_workflow.py
