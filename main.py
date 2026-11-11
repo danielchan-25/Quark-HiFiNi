@@ -42,7 +42,63 @@ ROOT = Path(__file__).resolve().parent
 USER_AGENT = "QuarkHiFiNi/1.0"
 DAILY_LIMIT = 1
 MAX_FAILURES = 3
+# 面板手动补录的百度百科词条：{normalized_artist/normalized_song: url}
+LYRICS_OVERRIDES = ROOT / "data" / "lyrics_overrides.json"
 PREVIEW_URL = "https://example.invalid/dry-run-no-share"
+
+# 百度百科词条正文抽取：标题精确匹配，再按内容块顺序收集歌词。
+# 面板验证脚本复用同一段 JS，保证「验证通过」与发布时提取结果一致。
+LYRICS_EXTRACT_JS = r"""(()=>{
+ const body=document.body.innerText;
+ if(/百度安全验证|请输入验证码|访问异常/.test(body))throw Error('百度百科要求安全验证');
+ const h1=document.querySelector('h1')?.innerText?.trim()||'';
+ const start=body.indexOf(h1);
+ const nodes=[...document.querySelectorAll('div[class*="para_"],h2,h3,h4,div[class*="paraTitle"],div[class*="table_"]')];
+ const flat=e=>((e.innerText||'').replace(/\s+/g,' ').trim());
+ const isHeading=e=>/^H[1-6]$/.test(e.tagName)||/paraTitle/i.test(e.className||'');
+ const dropRefs=s=>s.replace(/\[\s*\d+(?:\s*[-–—]\s*\d+)?\s*\]/g,'');
+ const normTitle=s=>s.replace(/\s*(播报|编辑)\s*/g,'').replace(/\s+/g,' ').trim();
+ const lyrTitle=e=>{
+   const t=normTitle(flat(e));
+   if(!t||t.length>14)return 0;
+   if(!/^(歌曲歌词|歌词)/.test(t))return 0;
+   if(/解析|鉴赏|赏析|评价|背景|主题|创作|版本|影响|视频|收录|介绍|简介/.test(t))return 0;
+   if(/^歌曲歌词/.test(t))return 4;
+   if(/^歌词(内容|文本|信息|全文)$/.test(t))return 3;
+   if(t==='歌词')return 2;
+   return 0;
+ };
+ let anchor=-1,best=0;
+ for(let i=0;i<nodes.length;i++){
+   const score=lyrTitle(nodes[i]);
+   if(score>best){best=score;anchor=i;}
+ }
+ if(anchor<0)return JSON.stringify({h1,intro:start>=0?body.slice(start,start+1200):body.slice(0,1200),lyrics:''});
+ const anchorTitle=normTitle(flat(nodes[anchor]));
+ const parts=[];
+ for(let i=anchor+1;i<nodes.length;i++){
+   const e=nodes[i];
+   if(isHeading(e)){
+     if(!parts.length&&normTitle(flat(e))===anchorTitle)continue;
+     break;
+   }
+   if(parts.length&&/unorderedList|orderedList/i.test(e.className||''))break;
+   const spans=[...e.querySelectorAll('span[class*="J-lemma-content-lemma-text"],span[data-text="true"]')];
+   let value='';
+   if(spans.length){
+     value=spans.map(s=>(s.innerText||'').trim()).filter(Boolean).join('\n');
+   }else{
+     if(e.querySelector('[class*="galleryWrapper"],[class*="lemmaPicture"],figure,img,video'))continue;
+     const clone=e.cloneNode(true);
+     clone.querySelectorAll('[class*="galleryWrapper"],[class*="lemmaPicture"],figure,img,video,sup,style,script').forEach(x=>x.remove());
+     value=(clone.innerText||'').trim();
+   }
+   value=dropRefs(value).trim();
+   if(value)parts.push(value);
+ }
+ return JSON.stringify({h1,intro:start>=0?body.slice(start,start+1200):body.slice(0,1200),lyrics:parts.join('\n')});
+})()"""
+
 SCHEMA_VERSION = 3
 IS_WINDOWS = os.name == "nt"
 BEIJING = timezone(timedelta(hours=8))
@@ -948,6 +1004,27 @@ def normalize_identity(value: str) -> str:
     return "".join(char for char in decomposed if char.isalnum() and not unicodedata.combining(char))
 
 
+def override_key(artist: str, song: str) -> str:
+    return f"{normalize_identity(artist)}/{normalize_identity(song)}"
+
+
+def load_lyrics_overrides() -> dict[str, str]:
+    """读取数据库中的手动词条映射；连接失败时阻止任务继续。"""
+    try:
+        payload = runtime.read_json(LYRICS_OVERRIDES, {})
+    except (OSError, ValueError):
+        return {}
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, item in items.items():
+        url = item.get("url") if isinstance(item, dict) else None
+        if isinstance(url, str) and url.strip():
+            out[str(key)] = url.strip()
+    return out
+
+
 def post_identity(title: str) -> tuple[str, str] | None:
     bracketed = re.match(r"^\s*(.*?)\s*(?:-\s*)?《([^》]+)》", title)
     if bracketed:
@@ -1125,7 +1202,8 @@ def lrclib_lyrics(artist: str, song: str) -> tuple[str, str]:
     raise LyricsLookupError("LRCLIB 未找到歌手和歌名均精确匹配且含歌词的记录")
 
 
-def lyrics_html(browser: HiFiNi, folder_name: str, reviewer: ShadowReviewer | None = None) -> tuple[str, str, str]:
+def lyrics_html(browser: HiFiNi, folder_name: str, reviewer: ShadowReviewer | None = None,
+                override_url: str | None = None) -> tuple[str, str, str]:
     if " x " in folder_name.lower(): raise FlowError("混合曲目录，等待人工处理")
     parsed = parse_folder(folder_name)
     if not parsed: raise FlowError("目录名不含歌手/歌曲分隔符")
@@ -1153,18 +1231,31 @@ def lyrics_html(browser: HiFiNi, folder_name: str, reviewer: ShadowReviewer | No
             search_errors.append(str(exc))
     # Search pages sometimes expose no conventional /item/ anchor despite an
     # exact lemma existing.  The canonical song URL is the final candidate.
+    if override_url:
+        candidate_urls.insert(0, override_url)
     candidate_urls.append(f"https://baike.baidu.com/item/{quote(song)}?fromModule=lemma_search-box")
     matched_song_and_artist = False
     loaded_pages = 0
     for url in dict.fromkeys(candidate_urls):
         try:
-            text = browser._eval(url, """(()=>{const body=document.body.innerText;if(/百度安全验证|请输入验证码|访问异常/.test(body))throw Error('百度百科要求安全验证');const h1=document.querySelector('h1')?.innerText?.trim()||'',start=body.indexOf(h1),h=[...document.querySelectorAll('h2')].find(x=>x.innerText.trim()==='歌曲歌词');let node=h?.parentElement?.nextElementSibling,parts=[];while(node&&!node.querySelector('h2')&&!node.className?.toString().includes('paraTitle')){const value=node.innerText?.trim();if(value)parts.push(value);node=node.nextElementSibling;}return JSON.stringify({h1,intro:start>=0?body.slice(start,start+1200):body.slice(0,1200),lyrics:parts.join('\\n')})})()""")
+            text = browser._eval(url, LYRICS_EXTRACT_JS)
             page = json.loads(text)
         except (FlowError, json.JSONDecodeError):
             continue
         if not page.get("h1"): continue
         loaded_pages += 1
         lyric_text = str(page["lyrics"]).strip()
+        if override_url and url == override_url:
+            # 人工指定的词条可信，不再要求词条 h1/简介严格匹配歌手与歌名，
+            # 但必须真的包含可用歌词，否则继续回退到自动搜索。
+            if reviewer is not None:
+                reviewer.page(folder_name, artist, song, page, url, True)
+            if not lyric_text.strip():
+                continue
+            browser.log.event("INFO", "lyrics_verified", resource=folder_name,
+                              source_url=url, provider="baike_manual",
+                              characters=len(lyric_text))
+            return artist, song, plain_lyrics_html(lyric_text)
         intro_key, artist_key = normalize_identity(page["intro"]), normalize_identity(artist)
         singer_at = intro_key.find(artist_key)
         singer_confirmed = singer_at >= 0 and any(
@@ -1249,6 +1340,10 @@ def run(args: argparse.Namespace) -> int:
 
 
 def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log: JsonLogger) -> int:
+    global DAILY_LIMIT
+    if getattr(args, "daily_limit", None):
+        DAILY_LIMIT = max(1, int(args.daily_limit))
+        log.event("INFO", "daily_limit_override", limit=DAILY_LIMIT)
     run_id = log.run_id
     durable = log.store
     notify = Feishu(settings, log, enabled=args.publish)
@@ -1283,17 +1378,32 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
             log.event("INFO", "run_finished", status=status, reason="daily_limit")
             return 0 if audit_healthy else 1
         folders = quark.media_folders(); log.event("INFO", "media_scanned", count=len(folders))
+        only = {str(x).strip() for x in (getattr(args, "only", None) or []) if str(x).strip()}
+        if only:
+            names = {folder["filename"] for folder in folders}
+            missing = sorted(only - names)
+            if missing:
+                raise FlowError("媒体目录中未找到：" + "、".join(missing))
+            folders = [folder for folder in folders if folder["filename"] in only]
+            log.event("INFO", "manual_folder_filter", requested=sorted(only),
+                      matched=[folder["filename"] for folder in folders])
         outcome = "SUCCESS" if audit_healthy else "PARTIAL_FAILURE"
         prepared = 0
+        overrides = load_lyrics_overrides()
+        retryable_with_override = {"SKIPPED_BAIKE_LOOKUP", "SKIPPED_NO_LYRICS",
+                                   "FAILED", "SKIPPED_TOO_MANY_FAILURES"}
         for folder in folders:
             record = store.upsert_resource(folder)
+            parsed_folder = parse_folder(folder["filename"])
+            override_url = overrides.get(override_key(*parsed_folder)) if parsed_folder else None
+            forced_retry = bool(override_url and record["status"] in retryable_with_override)
             if record["status"] in {"PUBLISHED", "PENDING_REVIEW", "SUBMITTED", "SKIPPED_TOO_MANY_FAILURES",
                                     "SKIPPED_NO_LYRICS", "SKIPPED_BAIKE_LOOKUP",
                                     "SKIPPED_BITRATE_FAILURE", "SKIPPED_TITLE_CONFLICT", "SKIPPED_MANUAL_REVIEW",
-                                    "SUBMISSION_UNKNOWN", "REJECTED", "DELETED", "SUPERSEDED"}:
+                                    "SUBMISSION_UNKNOWN", "REJECTED", "DELETED", "SUPERSEDED"} and not forced_retry:
                 log.event("INFO", "resource_already_handled", resource_id=record["id"], status=record["status"])
                 continue
-            if record["failure_count"] >= MAX_FAILURES:
+            if record["failure_count"] >= MAX_FAILURES and not override_url:
                 store.update(record["id"], "SKIPPED_TOO_MANY_FAILURES", detail="连续失败达到 3 次"); continue
             prior_rejection = store.db.execute(
                 "SELECT detail FROM submission_attempts WHERE resource_id=? AND status='REJECTED' "
@@ -1325,7 +1435,11 @@ def run_workflow(args: argparse.Namespace, settings: Settings, store: Store, log
                     log.event("WARNING", "resource_skipped", resource=folder["filename"],
                               reason="special_version", detail=detail)
                     continue
-                artist, song, lyrics = lyrics_html(hifini, folder["filename"], reviewer)
+                if override_url:
+                    log.event("INFO", "lyrics_override_selected", resource=folder["filename"],
+                              url=override_url)
+                artist, song, lyrics = lyrics_html(hifini, folder["filename"], reviewer,
+                                                   override_url=override_url)
                 measured_bitrates = inspect_mp3_bitrates(quark, folder_items, log)
                 format_label = audio_format_label(folder_items, measured_bitrates)
                 title = post_title(artist, song, format_label)
@@ -1596,6 +1710,10 @@ def cli(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True); cmd = sub.add_parser("run", help="scan and prepare at most one draft")
     cmd.add_argument("--dry-run", action="store_true", help="explicit safe mode; this is also the default")
     cmd.add_argument("--publish", action="store_true", help="reserved for an explicitly confirmed production submission")
+    cmd.add_argument("--only", action="append", metavar="FOLDER",
+                     help="只处理指定目录（可重复），用于人工补发")
+    cmd.add_argument("--daily-limit", type=int, default=None,
+                     help="本次进程覆盖每日发布上限（定时任务不受影响）")
     cmd.add_argument("--session-input", help=argparse.SUPPRESS)
     cmd.add_argument("--session-id", help=argparse.SUPPRESS)
     upload = sub.add_parser("upload", help="scan upload-files and upload missing songs; never publishes")

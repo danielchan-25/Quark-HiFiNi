@@ -76,6 +76,10 @@ bash scripts/run.sh upload --apply --slot-date YYYY-MM-DD --session-input '执�
 # 正式发布，一次最多一篇
 bash scripts/run.sh run --publish --session-input '执行一次正式发布' --session-id 'UNIX_SECONDS-ABC123'
 
+# 人工补发指定目录（可重复 --only；--daily-limit 只覆盖本次进程的每日额度）
+bash scripts/run.sh run --publish --only '张敬轩 - 笑忘书' --daily-limit 3 \
+  --session-input '人工补发笑忘书' --session-id 'UNIX_SECONDS-ABC123'
+
 # 本地预览每日总结；加 --send 才发送
 bash scripts/run.sh daily-summary --date YYYY-MM-DD
 ```
@@ -137,9 +141,9 @@ journalctl --user -u quark-hifini-monitor.service --since today
 
 ### MySQL 存储
 
-部署可通过 `STORAGE_BACKEND=mysql` 使用 MySQL 8。当前部署的数据库为 `Quark`，歌曲主表为 `hifini`；运行、事件、草稿、上传、AI 审核、历史迁移等表均以 `hifini_` 开头，不访问同库其他项目的表。
+部署可通过 `STORAGE_BACKEND=mysql` 使用 MySQL 8。当前部署的数据库为 `quark`，歌曲主表为 `hifini`；运行、事件、草稿、上传、AI 审核、历史迁移等表均以 `hifini_` 开头，不访问同库其他项目的表。
 
-`hifini_state` 保存汇总发送回执、工作流、预检、监测与备份状态及导入的原始文件；`hifini_logs` 保存新增日志。MySQL 模式不再写本地 SQLite、状态 JSON、应用日志或文件锁，采用数据库事务和命名锁；数据库不可用时停止任务，不回退空库或本地状态。预览使用内存数据库隔离业务变更，第三方 CLI 的临时输出放在 `/tmp` 并自动清理。程序、连接凭据、浏览器和网盘设备授权仍由本机管理，`upload-files/` 是用户提供新文件的输入目录。
+`hifini_state` 保存歌词词条补录、歌词验证结果、汇总发送回执、工作流、预检、监测与备份状态及导入的原始文件；`hifini_logs` 保存新增日志。MySQL 模式不再写本地 SQLite、状态 JSON、应用日志或文件锁，采用数据库事务和命名锁；数据库不可用时停止任务，不回退空库或本地状态。预览使用内存数据库隔离业务变更，第三方 CLI 的临时输出放在 `/tmp` 并自动清理。程序、连接凭据、浏览器和网盘设备授权仍由本机管理，`upload-files/` 是用户提供新文件的输入目录。
 
 先备份、停止本项目任务、用 `migrate_mysql.py` 导入并逐行校验，再启用 MySQL 配置；不能仅改连接地址后从空库运行。迁移保持原主键、提交日期、防重发状态、历史原始 JSON 和通知回执，导入文件按字节校验。迁移工具默认只预览，`--execute` 才导入，不会替你切换生产。
 
@@ -187,3 +191,11 @@ find scripts -name '*.sh' -exec bash -n {} \;
 单元测试模拟网盘、网站和通知，不读取生产认证、不实际上传或发布。GitHub Actions 在 Ubuntu 执行离线测试及 Shell 语法检查；真实账号、浏览器登录、TUN/代理和网站变更仍需部署时验收。
 
 MIT License，保留原项目许可证。
+
+### 面板共享状态与备份
+
+歌词人工词条与验证结果通过 `hifini_state` 的 `data/lyrics_overrides.json`、`data/lyrics_override_status.json` 虚拟路径共享，面板和定时任务均读写同一数据库文档，不创建对应本地文件。多词条及验证结果使用固定顺序的事务行锁，修改链接或清除词条后会丢弃旧链接的异步验证结果。
+
+`/root/quark-panel` 的状态保存在 `panel_state`，浏览器在线率样本保存在 `panel_cdp_samples`，面板应用日志保存在 `panel_logs`。本机 schema 标记显式声明这三张附加表，每日 03:30 的备份同时导出并真实隔离恢复这 21 张应用表，保留面板程序和服务配置，不包含未声明的其他业务表。
+
+状态数据库不可用时明确失败，不使用空状态或本地副本。程序、依赖环境、连接配置与第三方浏览器／网盘授权仍保留在对应应用位置；音乐原文件保留在夸克，`upload-files/` 仅作为本地文件上传入口。

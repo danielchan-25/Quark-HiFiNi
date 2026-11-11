@@ -36,6 +36,10 @@ def export(cfg, target: Path):
             cursor.execute('SELECT content FROM `'+cfg.table('state')+'` WHERE path=%s',('metadata/schema',))
             schema=json.loads(cursor.fetchone()[0])
             expected={cfg.table(name) for name in [*schema['tables'],'state','logs']}
+            extra=set(schema.get('backup_tables', []))
+            if not all(re.fullmatch(r'[A-Za-z0-9_]{1,64}', name) for name in extra):
+                raise ValueError('附加备份表名无效')
+            expected.update(extra)
             cursor.execute('SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=%s',(cfg.database,))
             names=[r[0] for r in cursor.fetchall() if r[0] in expected]
             if set(names)!=expected:raise ValueError('本项目的数据表缺失，拒绝生成不完整备份')
@@ -58,7 +62,7 @@ def export(cfg, target: Path):
 def verify_restore(cfg, directory: Path, metadata):
     """Restore to unique temporary tables, compare every row, then remove only those tables."""
     prefix=cfg.prefix+'_restore_'+uuid.uuid4().hex[:8]
-    mapping={name:prefix+name[len(cfg.prefix):] for name in metadata['tables']}
+    mapping={name:prefix+'_'+hashlib.sha256(name.encode()).hexdigest()[:12] for name in metadata['tables']}
     db=mysql.connect(cfg);created=[]
     try:
         with db.cursor() as cursor:
@@ -120,6 +124,16 @@ def perform(root, destination, records, retention_days=14):
                 for path in (Path.home()/'.config/systemd/user').glob('quark-hifini-*'):
                     if path.is_file() and not path.is_symlink():
                         out=stage/'systemd'/path.name;out.parent.mkdir(exist_ok=True);shutil.copy2(path,out)
+                if 'panel_state' in metadata['tables']:
+                    panel=Path('/root/quark-panel')
+                    for path in panel.rglob('*'):
+                        relative=path.relative_to(panel)
+                        if any(part in ('.venv','.git','data','__pycache__') for part in relative.parts):continue
+                        if not path.is_file() or path.is_symlink() or path.suffix=='.log':continue
+                        out=stage/'panel-source'/relative;out.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(path,out)
+                    service=Path('/etc/systemd/system/quark-panel.service')
+                    if service.is_file():
+                        out=stage/'systemd'/service.name;out.parent.mkdir(exist_ok=True);shutil.copy2(service,out)
                 result['git_commit']=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
                 manifest={str(f.relative_to(stage)):backup.digest(f) for f in stage.rglob('*') if f.is_file()}
                 archive=Path(directory)/filename

@@ -191,7 +191,8 @@ def run_summary(args) -> int:
             print(message)
             return 0
         directory = app.ROOT / 'data' / 'daily-summaries'
-        directory.mkdir(parents=True, exist_ok=True)
+        if not cfg:
+            directory.mkdir(parents=True, exist_ok=True)
         receipt = directory / (day.isoformat() + '.json')
         retried_receipt = directory / (day.isoformat() + '.retry.json')
         if runtime.exists(retried_receipt):

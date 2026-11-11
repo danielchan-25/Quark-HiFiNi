@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 
 import mysql_storage as mysql
+from db_documents import Documents
 
 
 def project(path: Path):
@@ -66,6 +67,25 @@ def read_json(path: Path, default=None):
 
 def write_json(path: Path, value, *, exclusive=False):
     put(path,json.dumps(value,ensure_ascii=False,indent=2).encode(),exclusive=exclusive)
+
+
+def update_json_documents(root: Path, defaults, update):
+    """Atomically edit related state documents; file fixtures remain supported."""
+    cfg = mysql.config(root)
+    if cfg:
+        keys = {str(path.relative_to(root)): value for path, value in defaults.items()}
+        documents = Documents(lambda: mysql.connect(cfg), cfg.table('state'))
+        def mutate(values):
+            by_path = {root / key: value for key, value in values.items()}
+            result = update(by_path)
+            values.update({str(path.relative_to(root)): value for path, value in by_path.items()})
+            return result
+        return documents.change(keys, mutate)
+    values = {path: read_json(path, default) for path, default in defaults.items()}
+    result = update(values)
+    for path, value in values.items():
+        write_json(path, value)
+    return result
 
 
 def text(path: Path):

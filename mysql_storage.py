@@ -19,7 +19,7 @@ class Config:
     user: str
     password: str = field(repr=False)
     port: int = 3306
-    database: str = 'Quark'
+    database: str = 'quark'
     prefix: str = 'hifini'
 
     def table(self, logical: str) -> str:
@@ -36,7 +36,7 @@ def config(root: Path) -> Config | None:
     if backend.strip().lower()=='sqlite':return None
     if backend.strip().lower()!='mysql':raise sqlite3.OperationalError('STORAGE_BACKEND 只能为 mysql 或 sqlite，禁止静默回退')
     cfg = Config(values.get('MYSQL_HOST', ''), values.get('MYSQL_USER', ''), values.get('MYSQL_PASSWORD', ''),
-                 int(values.get('MYSQL_PORT', '3306')), values.get('MYSQL_DATABASE', 'Quark'),
+                 int(values.get('MYSQL_PORT', '3306')), values.get('MYSQL_DATABASE', 'quark'),
                  values.get('MYSQL_TABLE_PREFIX', 'hifini'))
     if not cfg.host or not cfg.user or not all(re.fullmatch(r'[A-Za-z0-9_]+', x) for x in (cfg.database, cfg.prefix)):
         raise sqlite3.OperationalError('MySQL 连接配置不完整或数据库/表前缀无效')

@@ -76,7 +76,8 @@ def main() -> int:
     session_input = args.session_input_file.read_text(encoding='utf-8')
     if not session_input.strip():
         parser.error('The task instruction file is empty')
-    (ROOT / 'data').mkdir(parents=True, exist_ok=True)
+    if not runtime.enabled(ROOT):
+        (ROOT / 'data').mkdir(parents=True, exist_ok=True)
     try:
         lock_context = runtime.lock(ROOT, 'workflow', ROOT / 'data/daily-workflow.lock')
         lock_context.__enter__()

@@ -21,6 +21,8 @@ import daily_summary
 import preflight
 from scripts import daily_workflow
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from db_documents import Documents
 
 
 class StorageConfigurationTests(unittest.TestCase):
@@ -100,6 +102,21 @@ class MySQLTests(unittest.TestCase):
         with patch.object(daily_workflow,'ROOT',self.root),redirect_stdout(io.StringIO()):daily_workflow.finish({'date':'2026-01-01','publication':'busy'},'test-workflow')
         self.assertEqual(len(runtime.paths(self.root/'data/workflows/2026-01-01','*.json')),1)
 
+    def test_concurrent_state_edits_preserve_all_updates(self):
+        documents=Documents(lambda:mysql.connect(self.cfg),self.cfg.table('state'))
+        def edit(n):
+            def update(values):values['shared'].update({str(n):n})
+            documents.change({'shared':{}},update)
+        with ThreadPoolExecutor(max_workers=6) as pool:list(pool.map(edit,range(24)))
+        self.assertEqual(documents.get('shared'),{str(n):n for n in range(24)})
+
+    def test_lyrics_loader_reads_the_same_mysql_document(self):
+        path=self.root/'data/lyrics_overrides.json'
+        runtime.write_json(path,{'version':1,'items':{'artist/song':{'url':'https://baike.baidu.com/item/test'}}})
+        with patch.object(app,'LYRICS_OVERRIDES',path):
+            self.assertEqual(app.load_lyrics_overrides(),{'artist/song':'https://baike.baidu.com/item/test'})
+        self.assertFalse(path.exists())
+
     def test_preflight_and_logs_stay_in_mysql(self):
         preflight.persist(self.root,{'blockers':[]},0,'integration-health')
         self.assertEqual(preflight.read(self.root/'data/preflight/latest.json')['status'],'PASS')
@@ -164,15 +181,25 @@ store.close()
         row=self.resource();self.store.update(row['id'],'SUBMITTED',submitted_at='2026-01-01 00:00:00',hifini_url='https://www.hifini.net/thread-1.htm',detail='100% 中文')
         self.assertGreater(self.store.audit_candidates()[0]['pending_seconds'],0)
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM resources WHERE detail LIKE '%中文'").fetchone()[0],1)
-        unrelated=self.cfg.prefix+'_unrelated_test';db=mysql.connect(self.cfg,autocommit=True)
-        with db.cursor() as cursor:cursor.execute('CREATE TABLE `'+unrelated+'` (id INT)')
+        unrelated=self.cfg.prefix+'_unrelated_test';extra=self.cfg.prefix+'_owned_aux';db=mysql.connect(self.cfg,autocommit=True)
+        with db.cursor() as cursor:
+            cursor.execute('CREATE TABLE `'+unrelated+'` (id INT)')
+            cursor.execute('CREATE TABLE `'+extra+'` (id INT, detail TEXT)')
+            cursor.execute('INSERT INTO `'+extra+'` VALUES(1,%s)',('附加面板数据',))
+            payload=json.dumps(dict(self.schema,backup_tables=[extra]),ensure_ascii=False).encode()
+            import hashlib
+            cursor.execute('UPDATE `'+self.cfg.table('state')+'` SET content=%s,sha256=%s WHERE path=%s',(payload,hashlib.sha256(payload).hexdigest(),'metadata/schema'))
         with tempfile.TemporaryDirectory(prefix='mysql-restore-test-') as directory:
             try:
                 metadata=mysql_backup.export(self.cfg,Path(directory))
                 self.assertNotIn(unrelated,metadata['tables'])
+                self.assertIn(extra,metadata['tables'])
                 self.assertTrue(mysql_backup.verify_restore(self.cfg,Path(directory),metadata)['verified'])
             finally:
-                with db.cursor() as cursor:cursor.execute('DROP TABLE `'+unrelated+'`')
+                with db.cursor() as cursor:
+                    cursor.execute('DROP TABLE `'+unrelated+'`');cursor.execute('DROP TABLE `'+extra+'`')
+                    payload=json.dumps(self.schema,ensure_ascii=False).encode()
+                    cursor.execute('UPDATE `'+self.cfg.table('state')+'` SET content=%s,sha256=%s WHERE path=%s',(payload,hashlib.sha256(payload).hexdigest(),'metadata/schema'))
                 db.close()
 
 

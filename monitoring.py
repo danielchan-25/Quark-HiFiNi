@@ -201,7 +201,8 @@ def run_task(root: Path, task: str, command: list[str] | None = None) -> int:
     lock = None
     storage_error = None
     try:
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not runtime.enabled(root):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = runtime.lock(root,'monitor.'+task,directory/(task+'.lock'))
         lock.__enter__()
     except BlockingIOError:
